@@ -410,19 +410,19 @@ PRESS_COLS = [f"Press {i}" for i in range(1, 9)]
 # MYSQL DATA SOURCE – STERILIZER / PRESS
 # ============================================================
 DB_CONFIG = {
-    "host": os.getenv("PMC_DB_HOST", "185.93.167.15"),
-    "user": os.getenv("PMC_DB_USER", "mypalmcom_mms"),
-    "password": os.getenv("PMC_DB_PASSWORD", "ej1R]]HEzgpS"),
-    "database": os.getenv("PMC_DB_NAME", "mypalmcom_mqtt_pmc"),
+    "host": st.secrets["DB_HOST"],
+    "user": st.secrets["DB_USER"],
+    "password": st.secrets["DB_PASSWORD"],
+    "database": st.secrets["DB_NAME"],
 }
 
 # Running-hours data is stored in the Smart Perak Motor database,
 # separately from the MQTT sterilizer/press database.
 RUNNING_HOURS_DB_CONFIG = {
-    "host": os.getenv("PMC_RUNNING_HOURS_DB_HOST", "185.93.167.15"),
-    "user": os.getenv("PMC_RUNNING_HOURS_DB_USER", "mypalmcom_mms"),
-    "password": os.getenv("PMC_RUNNING_HOURS_DB_PASSWORD", "ej1R]]HEzgpS"),
-    "database": os.getenv("PMC_RUNNING_HOURS_DB_NAME", "mypalmcom_smartperakmotor"),
+    "host": st.secrets["RUNNING_HOURS_DB_HOST"],
+    "user": st.secrets["RUNNING_HOURS_DB_USER"],
+    "password": st.secrets["RUNNING_HOURS_DB_PASSWORD"],
+    "database": st.secrets["RUNNING_HOURS_DB_NAME"],
 }
 
 
@@ -506,37 +506,19 @@ def load_running_hours_db():
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_grading_average_data(start_date, end_date):
-    """Load daily average grading percentages from Smart Perak Motor DB."""
-    engine = get_running_hours_db_engine()
-    sql = text("""
-        SELECT `date`, `underripe_pct`, `ripe_pct`, `overripe_pct`,
-               `hard_pct`, `empty_pct`, `longstalk_pct`, `unripe_pct`
-        FROM `grading_average_data`
-        WHERE `date` BETWEEN :start_date AND :end_date
-        ORDER BY `date`
-    """)
-    with engine.connect() as conn:
-        df = pd.read_sql(sql, conn, params={"start_date": start_date, "end_date": end_date})
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    grading_cols = ["underripe_pct", "ripe_pct", "overripe_pct", "hard_pct",
-                    "empty_pct", "longstalk_pct", "unripe_pct"]
-    for col in grading_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def load_sterilizer_performance_window(start_dt, end_dt):
-    """Load sterilizer_performance records used to confirm a selected high NIR sample.
+    """Load ALL sterilizer_performance records for the selected calendar dates.
 
-    This table is in the Smart Perak Motor database and contains the actual
-    recorded cycle_no, p1, p2, p3 and back_pressure_receiver (BPV) values.
+    IMPORTANT: the sterilizer_performance table has separate ``date`` and
+    ``time`` columns.  The selected-date filter is therefore applied to the
+    table's ``date`` column itself, not to a derived cycle/door timestamp.
+    This prevents valid records from disappearing when cooking/door timestamps
+    are missing or fall on a different day.
     """
     engine = get_running_hours_db_engine()
+    start_date = pd.Timestamp(start_dt).date()
+    end_date = pd.Timestamp(end_dt).date()
     sql = text("""
         SELECT
             id,
@@ -546,44 +528,61 @@ def load_sterilizer_performance_window(start_dt, end_dt):
             status,
             cycle_no,
             old_cycle_no,
+            back_pressure_receiver,
             p1,
             p2,
             p3,
-            back_pressure_receiver,
             cooking_start_time,
             cooking_stop_time,
             door_shut_time,
             door_open_time,
+            initial_steam,
+            final_blow,
+            checked_flag,
             insdt
         FROM sterilizer_performance
-        WHERE sterilizer IN (1, 2, 3, 4, 5)
-          AND date >= DATE(:start_dt)
-          AND date <= DATE(:end_dt)
-        ORDER BY sterilizer, cycle_no, date, time, insdt
+        WHERE date >= :start_date
+          AND date <= :end_date
+          AND sterilizer IN (6, 7, 8, 9, 10)
+        ORDER BY date, time, sterilizer, cycle_no, id
     """)
     with engine.connect() as conn:
-        df = pd.read_sql(sql, conn, params={"start_dt": start_dt, "end_dt": end_dt})
+        df = pd.read_sql(
+            sql,
+            conn,
+            params={"start_date": start_date, "end_date": end_date},
+        )
 
     if df.empty:
         return df
 
-    for c in ["date", "cooking_start_time", "cooking_stop_time", "door_shut_time", "door_open_time", "insdt"]:
+    # Keep the source date/time exactly as the performance-record reference.
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["time"] = df["time"].astype(str).replace({"NaT": "", "nan": ""})
+
+    # Build a plotting/reference timestamp from date + time first.
+    # Fall back to insdt / cooking-stop / door-open when necessary.
+    date_text = df["date"].dt.strftime("%Y-%m-%d")
+    df["record_time"] = pd.to_datetime(
+        date_text + " " + df["time"], errors="coerce"
+    )
+
+    for c in ["cooking_start_time", "cooking_stop_time", "door_shut_time", "door_open_time", "insdt"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # Build a usable cycle completion/reference timestamp. Prefer door-open,
-    # then cooking-stop, then the performance record timestamp.
-    df["cycle_ref_time"] = pd.NaT
-    for c in ["door_open_time", "cooking_stop_time", "insdt"]:
+    for c in ["cooking_stop_time", "door_open_time", "insdt"]:
         if c in df.columns:
-            df["cycle_ref_time"] = df["cycle_ref_time"].fillna(df[c])
+            df["record_time"] = df["record_time"].fillna(df[c])
+
+    # Keep the old name too because the process-confirmation code uses it.
+    df["cycle_ref_time"] = df["record_time"]
 
     for c in ["sterilizer", "cycle_no", "p1", "p2", "p3", "back_pressure_receiver"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
-
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -689,8 +688,43 @@ def load_press_confirmation_hour(sample_dt, press_no):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
+def load_press_confirmation_all_hour(sample_dt):
+    """Load all Press/Digester records for the exact clock hour containing the NIR sample."""
+    engine = get_db_engine()
+    sample_dt = pd.Timestamp(sample_dt)
+    hour_start = sample_dt.floor("h")
+    hour_end = hour_start + pd.Timedelta(hours=1)
+
+    cols = ["ts_local"]
+    for i in range(1, 9):
+        cols += [
+            f"d{i}_amp AS d{i}_amp", f"d{i}_temp AS d{i}_temp", f"d{i}_level AS d{i}_level",
+            f"sp{i}_amp AS sp{i}_amp", f"sp{i}_setpoint AS sp{i}_setpoint",
+            f"sp{i}_hpu_pressure AS sp{i}_hpu_pressure", f"sp{i}_auto_manual AS sp{i}_auto_manual",
+        ]
+    sql = text(f"""
+        SELECT {', '.join(cols)}
+        FROM pmc_press_station_log
+        WHERE ts_local >= :start_dt AND ts_local < :end_dt
+        ORDER BY ts_local ASC
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(sql, conn, params={
+            "start_dt": hour_start.to_pydatetime(),
+            "end_dt": hour_end.to_pydatetime(),
+        })
+    if df.empty:
+        return df
+    df["ts_local"] = pd.to_datetime(df["ts_local"], errors="coerce")
+    for i in range(1, 9):
+        for c in [f"d{i}_amp", f"d{i}_temp", f"sp{i}_amp", f"sp{i}_setpoint", f"sp{i}_hpu_pressure"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["ts_local"]).sort_values("ts_local")
+
+
 def load_sterilizer_confirmation_previous_hour(sample_dt):
-    """Load Sterilizer 1-5 records from the hour immediately before the NIR hour.
+    """Load Sterilizer 6-10 records from the hour immediately before the NIR hour.
 
     Example: NIR at 00:42 on 24-Sep-2026 -> Sterilizer window is
     23:00:00-23:59:59 on 23-Sep-2026. Matching is based on the actual
@@ -722,7 +756,7 @@ def load_sterilizer_confirmation_previous_hour(sample_dt):
             door_open_time,
             insdt
         FROM sterilizer_performance
-        WHERE sterilizer IN (1, 2, 3, 4, 5)
+        WHERE sterilizer IN (6, 7, 8, 9, 10)
           AND date >= :start_date
           AND date <= :end_date
         ORDER BY sterilizer, date, time, id
@@ -753,7 +787,7 @@ def render_high_nir_process_confirmation(selected, press_name, high_limit=4.7):
     """Complete process confirmation for a high NIR point.
 
     It combines the selected Press's nearest process record with the actual
-    sterilizer cycle records for Sterilizers 1-5. Values are displayed as
+    sterilizer cycle records for Sterilizers 6-10. Values are displayed as
     observations; the dashboard does not claim causation from one sample.
     """
     if selected is None or float(selected.get("value", 0)) <= high_limit:
@@ -832,18 +866,18 @@ def render_high_nir_process_confirmation(selected, press_name, high_limit=4.7):
         perf = pd.DataFrame()
         st.warning(f"Sterilizer cycle confirmation could not be loaded: {exc}")
 
-    st.markdown("**Sterilizer Cycle Confirmation — Sterilizer 1 to 5**")
+    st.markdown("**Sterilizer Cycle Confirmation — Sterilizer 6 to 10**")
     if perf.empty:
         st.info("No sterilizer performance records were found around the selected NIR sample.")
         return
 
-    perf = perf[perf["sterilizer"].isin([1, 2, 3, 4, 5])].copy()
+    perf = perf[perf["sterilizer"].isin([6, 7, 8, 9, 10])].copy()
     if perf.empty:
-        st.info("No Sterilizer 1–5 records were found around the selected NIR sample.")
+        st.info("No Sterilizer 6–10 records were found around the selected NIR sample.")
         return
 
     cards = []
-    for ster_no in [1, 2, 3, 4, 5]:
+    for ster_no in [6, 7, 8, 9, 10]:
         g = perf[perf["sterilizer"] == ster_no].copy()
         if g.empty:
             cards.append((ster_no, None))
@@ -1128,14 +1162,14 @@ def render_process_confirmation_page():
 
     if perf.empty:
         st.warning(
-            "No Sterilizer 1–5 performance records were found in the previous hour "
+            "No Sterilizer 6–10 performance records were found in the previous hour "
             f"({ster_start.strftime('%d %b %Y %H:%M')}–{(ster_end - pd.Timedelta(seconds=1)).strftime('%H:%M:%S')})."
         )
     else:
         # Keep each sterilizer separate. If more than one record/cycle exists in
         # the hour, show the latest cycle for the confirmation card and expose
         # the complete records below it.
-        for ster_no in [1, 2, 3, 4, 5]:
+        for ster_no in [6, 7, 8, 9, 10]:
             g = perf[perf["sterilizer"] == ster_no].copy()
             st.markdown(f"### Sterilizer {ster_no}")
             if g.empty:
@@ -1177,7 +1211,7 @@ def render_process_confirmation_page():
             detail["Record Time"] = pd.to_datetime(detail["Record Time"], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
             st.dataframe(detail, use_container_width=True, hide_index=True)
 
-    st.caption("This analysis uses the NIR clock hour for Press/Digester data and the immediately preceding clock hour for Sterilizer 1–5 cycle data. It is a process correlation check, not a causal determination.")
+    st.caption("This analysis uses the NIR clock hour for Press/Digester data and the immediately preceding clock hour for Sterilizer 6–10 cycle data. It is a process correlation check, not a causal determination.")
 
 
 # ============================================================
@@ -1186,6 +1220,48 @@ def render_process_confirmation_page():
 SECONDARY_SETLINE = 1.6
 
 @st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=1200, show_spinner=False)
+def load_grading_average_data(start_date, end_date):
+    """Load daily average grading data from mypalmcom_smartperakmotor."""
+    engine = get_running_hours_db_engine()
+    sql = text("""
+        SELECT
+            `date`,
+            `underripe_pct`,
+            `ripe_pct`,
+            `overripe_pct`,
+            `hard_pct`,
+            `empty_pct`,
+            `longstalk_pct`,
+            `unripe_pct`
+        FROM `grading_average_data`
+        WHERE `date` BETWEEN :start_date AND :end_date
+        ORDER BY `date`
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(
+            sql,
+            conn,
+            params={"start_date": start_date, "end_date": end_date},
+        )
+
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    grading_cols = [
+        "underripe_pct",
+        "ripe_pct",
+        "overripe_pct",
+        "hard_pct",
+        "empty_pct",
+        "longstalk_pct",
+        "unripe_pct",
+    ]
+    for col in grading_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.sort_values("date").reset_index(drop=True)
 def load_secondary_oil_loss(start_dt, end_dt):
     engine = get_running_hours_db_engine()
     sql = text("""
@@ -1733,6 +1809,91 @@ def analyze_associated_row(row, press_name):
     return findings
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_nir_pressedfiber_db(start_date, end_date):
+    """Load NIR pressed-fiber samples from Smart Perak Motor DB.
+
+    Each sample_id contains the press number after the text 'press'.
+    Example: 21-9-26-press12060921-05519 -> Press 1.
+    The raw DB rows are kept so a selected graph point can still be
+    traced back to its original sample_id/timestamp.
+    """
+    engine = get_running_hours_db_engine()
+
+    start_dt = pd.Timestamp(start_date)
+    end_dt = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+    sql = text("""
+        SELECT
+            `sample_id`,
+            `val2`,
+            `timestamp`
+        FROM `nir_pressedfiber`
+        WHERE `timestamp` BETWEEN :start_dt AND :end_dt
+        ORDER BY `timestamp`
+    """)
+
+    with engine.connect() as conn:
+        df = pd.read_sql(
+            sql,
+            conn,
+            params={
+                "start_dt": start_dt.to_pydatetime(),
+                "end_dt": end_dt.to_pydatetime(),
+            },
+        )
+
+    if df.empty:
+        return df, df.copy()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["val2"] = pd.to_numeric(df["val2"], errors="coerce")
+    df["sample_id"] = df["sample_id"].astype("string")
+
+    # Extract the press number immediately after 'press'.
+    # For example:
+    #   press120... -> Press 1
+    #   press220... -> Press 2
+    #   press720... -> Press 7
+    df["press_no"] = pd.to_numeric(
+        df["sample_id"].str.extract(r"press\s*([1-8])", expand=False),
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["timestamp", "val2", "press_no"]).copy()
+    df["press_no"] = df["press_no"].astype(int)
+
+    # Keep only Press 1–8 for the eight NIR cards.
+    df = df[df["press_no"].between(1, 8)].copy()
+
+    # Preserve the DB row identity for point selection.
+    df["_SourceRow"] = range(len(df))
+
+    df["Date"] = df["timestamp"].dt.normalize()
+    df["Sampling Time"] = df["timestamp"].dt.strftime("%H:%M:%S")
+    df["DateTime"] = df["timestamp"]
+
+    # Convert the row-oriented DB data into the same Press 1–8 structure
+    # expected by the existing NIR trend cards.
+    for press_no in range(1, 9):
+        col = f"Press {press_no}"
+        df[col] = pd.NA
+        mask = df["press_no"].eq(press_no)
+        df.loc[mask, col] = df.loc[mask, "val2"]
+
+    for col in PRESS_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.sort_values("DateTime").reset_index(drop=True)
+    df["_SourceRow"] = range(len(df))
+
+    # source_flat is the DB-row lookup used by the existing point-analysis
+    # section. It now contains sample_id/val2/timestamp instead of Excel data.
+    source_flat = df.set_index("_SourceRow", drop=False).copy()
+
+    return df, source_flat
+
+
 @st.cache_data
 def load_data(uploaded_file=None):
     source = uploaded_file if uploaded_file is not None else Path(DEFAULT_FILE)
@@ -1798,7 +1959,7 @@ def load_data(uploaded_file=None):
 # a different name.
 CLARIFICATION_TABLE = os.getenv(
     "PMC_CLARIFICATION_TABLE",
-    "pmc_clarification_station_log",
+    "pmc_clarification_data_log",
 )
 
 
@@ -1895,6 +2056,56 @@ def load_clarification_db(start_dt, end_dt):
             else:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["ts_local"]).sort_values("ts_local").reset_index(drop=True)
+
+
+def _clarification_duration_above_threshold(df, column, threshold, window_start, window_end, max_gap_minutes=15):
+    """Estimate hours above a threshold from consecutive clarification readings.
+
+    Only consecutive readings with a gap of <= max_gap_minutes are counted so a
+    missing-data gap is not incorrectly treated as continuous operation.
+    """
+    if df.empty or column not in df.columns:
+        return 0.0
+
+    work = df[["ts_local", column]].copy()
+    work["ts_local"] = pd.to_datetime(work["ts_local"], errors="coerce")
+    work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["ts_local", column]).sort_values("ts_local")
+    if work.empty:
+        return 0.0
+
+    start = pd.Timestamp(window_start)
+    end = pd.Timestamp(window_end)
+    work = work[(work["ts_local"] >= start) & (work["ts_local"] <= end)].copy()
+    if work.empty:
+        return 0.0
+
+    work["next_time"] = work["ts_local"].shift(-1).fillna(end)
+    work["next_time"] = work["next_time"].clip(upper=end)
+    work["duration_hours"] = (
+        work["next_time"] - work["ts_local"]
+    ).dt.total_seconds() / 3600.0
+
+    valid_gap = work["duration_hours"].between(0, max_gap_minutes / 60.0)
+    above = work[column] > threshold
+    return float(work.loc[valid_gap & above, "duration_hours"].sum())
+
+
+def _clarification_running_status(df, column, window_start, window_end, amp_threshold=5.0):
+    """Return latest running state and estimated running hours for a motor-current column."""
+    latest_value = None
+    if not df.empty and column in df.columns:
+        valid = df[["ts_local", column]].copy()
+        valid[column] = pd.to_numeric(valid[column], errors="coerce")
+        valid = valid.dropna(subset=[column]).sort_values("ts_local")
+        if not valid.empty:
+            latest_value = float(valid.iloc[-1][column])
+
+    hours = _clarification_duration_above_threshold(
+        df, column, amp_threshold, window_start, window_end
+    )
+    running = latest_value is not None and latest_value > amp_threshold
+    return running, latest_value, hours
 
 
 def _trend_word(df, column):
@@ -2015,6 +2226,323 @@ if st.session_state.pmc_settings:
 
 
 
+
+def render_high_nir_inline_process_confirmation(selected, press_name, high_limit=4.7):
+    """Show process data inline when a selected NIR point is above 4.7%."""
+    if selected is None:
+        return
+
+    try:
+        nir_value = float(selected.get("value", 0))
+    except (TypeError, ValueError):
+        return
+
+    if nir_value <= high_limit:
+        return
+
+    sample_dt = pd.to_datetime(selected.get("datetime"), errors="coerce")
+    if pd.isna(sample_dt):
+        return
+
+    press_no_match = re.findall(r"\d+", str(press_name))
+    if not press_no_match:
+        return
+    press_no = int(press_no_match[-1])
+
+    st.markdown(
+        '<div class="section-heading" style="font-size:15px;margin-top:12px;">'
+        'High NIR Process Check</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"NIR {nir_value:.2f}% is above the fixed 4.70% limit. "
+        f"Press/Digester data uses the NIR clock hour "
+        f"({sample_dt.floor('h').strftime('%d %b %Y %H:%M')}–"
+        f"{(sample_dt.floor('h') + pd.Timedelta(hours=1) - pd.Timedelta(seconds=1)).strftime('%H:%M:%S')}); "
+        f"Sterilizer data uses the immediately preceding clock hour."
+    )
+
+    # ------------------------------------------------------------
+    # OVERALL GRADING: selected NIR sample date
+    # ------------------------------------------------------------
+    # The grading report is matched to the calendar date of the selected
+    # NIR sample. It is read from grading_average_data in the same
+    # mypalmcom_smartperakmotor database.
+    grading_date = sample_dt.date()
+    st.markdown(
+        '<div class="section-heading">Overall Grading Report</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Overall grading for the selected NIR sample date: "
+        f"{sample_dt.strftime('%d %b %Y')}"
+    )
+
+    try:
+        grading_selected = load_grading_average_data(grading_date, grading_date)
+    except Exception as exc:
+        grading_selected = pd.DataFrame()
+        st.warning(f"Overall grading data could not be loaded: {exc}")
+
+    if grading_selected.empty:
+        st.info(
+            f"No Overall Grading record was found for "
+            f"{sample_dt.strftime('%d %b %Y')}."
+        )
+    else:
+        # Normally there is one daily-average row. If the database contains
+        # more than one row for the same date, show all of them in the table.
+        grading_row = grading_selected.iloc[-1]
+        grading_categories = [
+            ("Underripe", "underripe_pct"),
+            ("Ripe", "ripe_pct"),
+            ("Overripe", "overripe_pct"),
+            ("Hard", "hard_pct"),
+            ("Empty", "empty_pct"),
+            ("Longstalk", "longstalk_pct"),
+            ("Unripe", "unripe_pct"),
+        ]
+
+        grading_cols = st.columns(7)
+        for col, (label, field) in zip(grading_cols, grading_categories):
+            value = pd.to_numeric(grading_row.get(field), errors="coerce")
+            value_text = f"{float(value):.2f}%" if pd.notna(value) else "--"
+            with col:
+                st.metric(label, value_text)
+
+        grading_display = grading_selected.copy()
+        grading_display["date"] = pd.to_datetime(
+            grading_display["date"], errors="coerce"
+        ).dt.strftime("%d-%m-%Y")
+        grading_display = grading_display.rename(
+            columns={
+                "date": "Date",
+                "underripe_pct": "Underripe (%)",
+                "ripe_pct": "Ripe (%)",
+                "overripe_pct": "Overripe (%)",
+                "hard_pct": "Hard (%)",
+                "empty_pct": "Empty (%)",
+                "longstalk_pct": "Longstalk (%)",
+                "unripe_pct": "Unripe (%)",
+            }
+        )
+        st.dataframe(
+            grading_display.round(2),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Show the selected-date grading distribution as a compact chart.
+        grading_chart = go.Figure()
+        for label, field in grading_categories:
+            chart_value = pd.to_numeric(grading_row.get(field), errors="coerce")
+            if pd.notna(chart_value):
+                grading_chart.add_trace(
+                    go.Bar(
+                        x=[label],
+                        y=[float(chart_value)],
+                        name=label,
+                        hovertemplate=f"{label}: %{{y:.2f}}%<extra></extra>",
+                    )
+                )
+        grading_chart.update_layout(
+            height=330,
+            margin=dict(l=45, r=20, t=25, b=55),
+            paper_bgcolor="#0b151d",
+            plot_bgcolor="#0b151d",
+            font=dict(color="#dbe5ec"),
+            showlegend=False,
+            xaxis=dict(title="Grading Category", gridcolor="#293a46"),
+            yaxis=dict(title="Percentage (%)", gridcolor="#293a46", zeroline=False),
+        )
+        st.plotly_chart(
+            grading_chart,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+
+    st.caption(
+        "The values shown are the actual database readings associated with the "
+        "selected high-NIR sample. This is a process correlation check; it does "
+        "not by itself establish causation."
+    )
+
+    # ------------------------------------------------------------
+    # STERILIZER: previous-hour cycle data
+    # ------------------------------------------------------------
+    try:
+        ster_df = load_sterilizer_confirmation_previous_hour(sample_dt)
+    except Exception as exc:
+        ster_df = pd.DataFrame()
+        st.warning(f"Sterilizer performance data could not be loaded: {exc}")
+
+    st.markdown("**Sterilizer Cycle Performance**")
+
+    if ster_df.empty:
+        ster_hour_start = sample_dt.floor("h") - pd.Timedelta(hours=1)
+        ster_hour_end = sample_dt.floor("h")
+        st.info(
+            "No Sterilizer 6–10 performance records were found in the previous hour "
+            f"({ster_hour_start.strftime('%d %b %Y %H:%M')}–"
+            f"{(ster_hour_end - pd.Timedelta(seconds=1)).strftime('%H:%M:%S')})."
+        )
+    else:
+        # Latest cycle for each sterilizer, while keeping the complete record
+        # table below so no cycle data is hidden.
+        latest_rows = []
+        for ster_no in [6, 7, 8, 9, 10]:
+            g = ster_df[ster_df["sterilizer"] == ster_no].sort_values(
+                ["event_dt", "id"]
+            )
+            if not g.empty:
+                latest_rows.append(g.iloc[-1])
+
+        if latest_rows:
+            st.markdown("**Latest cycle in the previous hour**")
+            for row in latest_rows:
+                cycle = pd.to_numeric(row.get("cycle_no"), errors="coerce")
+                ster_no = pd.to_numeric(row.get("sterilizer"), errors="coerce")
+                event_dt = pd.to_datetime(row.get("event_dt"), errors="coerce")
+
+                cols = st.columns(6)
+                values = [
+                    ("Sterilizer", int(ster_no) if pd.notna(ster_no) else "--"),
+                    ("Cycle", int(cycle) if pd.notna(cycle) else "--"),
+                    ("P1", _format_value(row.get("p1"), 1, " PSI")),
+                    ("P2", _format_value(row.get("p2"), 1, " PSI")),
+                    ("P3", _format_value(row.get("p3"), 1, " PSI")),
+                    ("BPV", _format_value(row.get("back_pressure_receiver"), 1, " PSI")),
+                ]
+                for c, (label, value) in zip(cols, values):
+                    with c:
+                        st.metric(label, value)
+
+                if pd.notna(event_dt):
+                    st.caption(
+                        f"Sterilizer {int(ster_no)} record time: "
+                        f"{event_dt.strftime('%d %b %Y %H:%M:%S')}"
+                    )
+
+        ster_detail = ster_df[
+            [
+                "event_dt",
+                "sterilizer",
+                "cycle_no",
+                "p1",
+                "p2",
+                "p3",
+                "back_pressure_receiver",
+                "status",
+            ]
+        ].copy()
+        ster_detail = ster_detail.rename(
+            columns={
+                "event_dt": "Record Time",
+                "sterilizer": "Sterilizer",
+                "cycle_no": "Cycle",
+                "p1": "P1 (PSI)",
+                "p2": "P2 (PSI)",
+                "p3": "P3 (PSI)",
+                "back_pressure_receiver": "BPV (PSI)",
+                "status": "Status",
+            }
+        )
+        ster_detail["Record Time"] = pd.to_datetime(
+            ster_detail["Record Time"], errors="coerce"
+        ).dt.strftime("%d %b %Y %H:%M:%S")
+
+        st.markdown("**All Sterilizer cycle records in the previous hour**")
+        st.dataframe(
+            ster_detail,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+    # ------------------------------------------------------------
+    # PRESS
+    # ------------------------------------------------------------
+    try:
+        press_df = load_press_confirmation_hour(sample_dt, press_no)
+    except Exception as exc:
+        press_df = pd.DataFrame()
+        st.warning(f"Press/Digester data could not be loaded: {exc}")
+
+    st.markdown("**Press Performance**")
+
+    if press_df.empty:
+        st.info(f"No Press {press_no} / Digester records were found in the NIR hour.")
+    else:
+        press_df = press_df.sort_values("ts_local").copy()
+        latest = press_df.iloc[-1]
+
+        latest_dt = pd.to_datetime(latest.get("ts_local"), errors="coerce")
+        press_values = [
+            ("Record time", latest_dt.strftime("%d %b %H:%M:%S") if pd.notna(latest_dt) else "--"),
+            ("Press setpoint", _format_value(latest.get("press_setpoint"), 1, " A")),
+            ("Press motor amps", _format_value(latest.get("press_motor_amp"), 1, " A")),
+            ("Hydraulic pressure", _format_value(latest.get("hydraulic_pressure"), 1, " bar")),
+            ("Auto / Manual", str(latest.get("auto_manual") or "--")),
+        ]
+        metric_cols = st.columns(5)
+        for col, (label, value) in zip(metric_cols, press_values):
+            with col:
+                st.metric(label, value)
+
+        press_detail = press_df[
+            ["ts_local", "press_setpoint", "press_motor_amp", "hydraulic_pressure", "auto_manual"]
+        ].copy().rename(
+            columns={
+                "ts_local": "Record Time",
+                "press_setpoint": "Press Setpoint (A)",
+                "press_motor_amp": "Press Motor Amps (A)",
+                "hydraulic_pressure": "Hydraulic Pressure (bar)",
+                "auto_manual": "Auto / Manual",
+            }
+        )
+        press_detail["Record Time"] = pd.to_datetime(
+            press_detail["Record Time"], errors="coerce"
+        ).dt.strftime("%d %b %Y %H:%M:%S")
+        st.dataframe(press_detail, use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------
+    # DIGESTER
+    # ------------------------------------------------------------
+    st.markdown("**Digester Performance**")
+
+    if press_df.empty:
+        st.info(f"No Digester records were found for Press {press_no} in the NIR hour.")
+    else:
+        latest = press_df.iloc[-1]
+        latest_dt = pd.to_datetime(latest.get("ts_local"), errors="coerce")
+        digester_values = [
+            ("Record time", latest_dt.strftime("%d %b %H:%M:%S") if pd.notna(latest_dt) else "--"),
+            ("Digester level", _level_status(latest.get("digester_level"))),
+            ("Digester temperature", _format_value(latest.get("digester_temp"), 1, " °C")),
+            ("Digester amps", _format_value(latest.get("digester_amp"), 1, " A")),
+        ]
+        metric_cols = st.columns(4)
+        for col, (label, value) in zip(metric_cols, digester_values):
+            with col:
+                st.metric(label, value)
+
+        digester_detail = press_df[
+            ["ts_local", "digester_level", "digester_temp", "digester_amp"]
+        ].copy().rename(
+            columns={
+                "ts_local": "Record Time",
+                "digester_level": "Digester Level",
+                "digester_temp": "Digester Temperature (°C)",
+                "digester_amp": "Digester Amps (A)",
+            }
+        )
+        digester_detail["Record Time"] = pd.to_datetime(
+            digester_detail["Record Time"], errors="coerce"
+        ).dt.strftime("%d %b %Y %H:%M:%S")
+        st.dataframe(digester_detail, use_container_width=True, hide_index=True)
+
+
+
 def render_point_recommendation(
     press,
     selected,
@@ -2028,7 +2556,7 @@ def render_point_recommendation(
     selected_dt = selected["datetime"]
 
     # NIR alert uses one fixed limit only.
-    nir_status = "HIGH" if enable_alert and selected_value > high_limit else "NORMAL"
+    nir_status = "HIGH" if selected_value > high_limit else "NORMAL"
 
     st.markdown(
         f"""
@@ -2143,34 +2671,14 @@ if page == "Lab Oil Loss – NIR Data Trend":
         unsafe_allow_html=True,
     )
 
-    with st.expander("📁 Data Source", expanded=False):
-        uploaded = st.file_uploader(
-            "Upload production monitoring Excel/report",
-            type=["xls", "xlsx", "html"],
-        )
-
-    try:
-        loaded = load_data(uploaded)
-    except Exception as e:
-        st.error(f"Unable to read the report: {e}")
-        st.stop()
-
-    if loaded is None:
-        st.warning(
-            f"Place '{DEFAULT_FILE}' beside this Python file, "
-            "or upload the report above."
-        )
-        st.stop()
-
-    raw, nir, source_flat = loaded
-
-    available_dates = sorted(
-        nir["Date"].dropna().dt.date.unique()
+    st.markdown(
+        '<div class="section-heading">NIR Data Source</div>',
+        unsafe_allow_html=True,
     )
-
-    if not available_dates:
-        st.error("No valid NIR dates were found.")
-        st.stop()
+    st.caption(
+        "Live NIR data source: mypalmcom_smartperakmotor → nir_pressedfiber. "
+        "Press number is extracted from sample_id after 'press'."
+    )
 
     # --------------------------------------------------------
     # DATE FILTER
@@ -2185,17 +2693,15 @@ if page == "Lab Oil Loss – NIR Data Trend":
     with f1:
         start_date = st.date_input(
             "From Date",
-            value=available_dates[0],
-            min_value=available_dates[0],
-            max_value=available_dates[-1],
+            value=date(2026, 9, 21),
+            key="nir_start_date",
         )
 
     with f2:
         end_date = st.date_input(
             "To Date",
-            value=available_dates[-1],
-            min_value=available_dates[0],
-            max_value=available_dates[-1],
+            value=date(2026, 9, 25),
+            key="nir_end_date",
         )
 
     with f3:
@@ -2214,12 +2720,26 @@ if page == "Lab Oil Loss – NIR Data Trend":
         st.error("From Date cannot be later than To Date.")
         st.stop()
 
-    filtered = nir[
-        (nir["Date"].dt.date >= start_date)
-        & (nir["Date"].dt.date <= end_date)
-    ].copy()
+    try:
+        nir, source_flat = load_nir_pressedfiber_db(start_date, end_date)
+    except Exception as e:
+        st.error(f"Unable to read NIR data from nir_pressedfiber: {e}")
+        st.stop()
 
-    # --------------------------------------------------------
+    # The old Excel version used a dataframe named `filtered` after applying
+    # the selected date range. The DB loader already applies the From/To date
+    # filter in SQL, so use the returned DB dataframe as `filtered` for the
+    # existing NIR trend code below.
+    filtered = nir.copy()
+
+    if nir.empty:
+        st.warning(
+            f"No NIR data found in nir_pressedfiber for "
+            f"{start_date.strftime("%d %b %Y")} to {end_date.strftime("%d %b %Y")}."
+        )
+        st.stop()
+
+
     # ALERT SETTINGS
     # --------------------------------------------------------
     st.markdown(
@@ -2230,21 +2750,20 @@ if page == "Lab Oil Loss – NIR Data Trend":
     with st.container(border=True):
         a1, a2, a3 = st.columns([1, 1, 3])
 
+        enable_alert = True
+        high_limit = 4.7
+
         with a1:
-            enable_alert = st.toggle(
-                "Enable alerts",
-                value=True,
-            )
+            st.metric("NIR High Setpoint", "4.70%")
 
         with a2:
-            high_limit = 4.7
-            st.metric("NIR Alert Limit", "4.70%")
+            st.metric("Low Limit", "Not used")
 
         with a3:
             st.caption(
-                "NIR alert is fixed at 4.70%. No NIR low limit is used. "
-                "When a point is selected, the exact Excel row at that timestamp "
-                "is checked against the Sterilizer and Press alert settings."
+                "The 4.70% high-loss alert is always active. Select any NIR point above 4.70% "
+                "to open the full process check using the NIR timestamp: Press/Digester = same clock hour; "
+                "Sterilizer = immediately preceding clock hour."
             )
 
     # --------------------------------------------------------
@@ -2278,7 +2797,7 @@ if page == "Lab Oil Loss – NIR Data Trend":
         else:
             latest = float(values.iloc[-1])
 
-            if enable_alert and latest > high_limit:
+            if latest > high_limit:
                 status = "HIGH"
             else:
                 status = "NORMAL"
@@ -2291,31 +2810,67 @@ if page == "Lab Oil Loss – NIR Data Trend":
                 "status": status,
             }
 
-    high_presses = [
-        p for p in PRESS_COLS
-        if press_info[p]["status"] == "HIGH"
-    ]
+    # --------------------------------------------------------
+    # NIR HIGH-LOSS ALERT SUMMARY
+    # --------------------------------------------------------
+    # The 4.70% limit is always active. The alert is based on the actual
+    # NIR samples in the selected date range, not only the latest sample.
+    high_sample_frames = []
+    for press in PRESS_COLS:
+        h = (
+            filtered[["DateTime", press]]
+            .dropna(subset=[press])
+            .drop_duplicates(subset=["DateTime", press], keep="first")
+            .copy()
+        )
+        h = h[h[press] > high_limit]
+        if not h.empty:
+            h["Press"] = press
+            h["NIR Oil Loss (%)"] = pd.to_numeric(h[press], errors="coerce")
+            high_sample_frames.append(h[["DateTime", "Press", "NIR Oil Loss (%)"]])
 
-    if enable_alert and high_presses:
-        alert_parts = []
+    high_samples = (
+        pd.concat(high_sample_frames, ignore_index=True).sort_values("DateTime")
+        if high_sample_frames else pd.DataFrame(columns=["DateTime", "Press", "NIR Oil Loss (%)"])
+    )
+    high_count = len(high_samples)
+    affected_presses = sorted(high_samples["Press"].unique().tolist()) if high_count else []
+    latest_high = high_samples.iloc[-1] if high_count else None
 
-        if high_presses:
-            alert_parts.append(
-                "HIGH: " + ", ".join(high_presses)
-            )
-
-
+    if high_count:
+        affected_text = ", ".join(affected_presses)
+        latest_text = (
+            f"Latest high sample: <b>{latest_high['Press']}</b> · "
+            f"<b>{float(latest_high['NIR Oil Loss (%)']):.2f}%</b> · "
+            f"{pd.Timestamp(latest_high['DateTime']).strftime('%d %b %Y %H:%M:%S')}"
+        )
         st.markdown(
-            f"""
-            <div class="alert-panel">
-                <div class="alert-title">
-                    ⚠ NIR Alert Active
+            f"""<div class=\"alert-panel\">
+                <div class=\"alert-title\">⚠ NIR HIGH OIL LOSS ALERT</div>
+                <div class=\"alert-text\">
+                    NIR samples above the fixed <b>4.70%</b> setpoint: <b>{high_count}</b>
+                    &nbsp; | &nbsp; Affected: <b>{affected_text}</b>
                 </div>
-                <div class="alert-text">
-                    {" &nbsp; | &nbsp; ".join(alert_parts)}
+                <div class=\"alert-text\" style=\"margin-top:6px;\">{latest_text}</div>
+                <div class=\"point-alert-recommendation\" style=\"margin-top:8px;\">
+                    Select any NIR point above 4.70% to open the full High NIR Process Check.
+                    Process timing: Press/Digester = NIR clock hour; Sterilizer = immediately preceding clock hour.
                 </div>
-            </div>
-            """,
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        with st.expander("View High NIR Samples", expanded=False):
+            high_display = high_samples.copy()
+            high_display["DateTime"] = pd.to_datetime(high_display["DateTime"]).dt.strftime("%d %b %Y %H:%M:%S")
+            st.dataframe(high_display, use_container_width=True, hide_index=True)
+    else:
+        st.markdown(
+            """<div class=\"point-good\">
+                <div class=\"point-good-title\">✓ NIR Within Setpoint</div>
+                <div class=\"point-good-detail\">
+                    No NIR sample is above the fixed 4.70% high-loss setpoint in the selected period.
+                </div>
+            </div>""",
             unsafe_allow_html=True,
         )
 
@@ -2522,16 +3077,16 @@ if page == "Lab Oil Loss – NIR Data Trend":
                             )
                         )
 
-                    if enable_alert:
-                        fig.add_hline(
-                            y=high_limit,
-                            line_dash="dash",
-                            line_color="#ef4444",
-                            line_width=1.5,
-                            annotation_text=f"HIGH {high_limit:.1f}%",
-                            annotation_font_color="#f87171",
-                            annotation_position="top right",
-                        )
+                    # Fixed NIR reference line: always visible on every Press graph.
+                    fig.add_hline(
+                        y=4.7,
+                        line_dash="dash",
+                        line_color="#ef4444",
+                        line_width=1.5,
+                        annotation_text="NIR LIMIT 4.7%",
+                        annotation_font_color="#f87171",
+                        annotation_position="top right",
+                    )
 
 
                     fig.update_layout(
@@ -2583,12 +3138,20 @@ if page == "Lab Oil Loss – NIR Data Trend":
                             cd = point.get("customdata")
 
                             if cd:
-                                st.session_state.selected_nir_point = {
+                                selected_point = {
                                     "press": str(cd[0]),
                                     "source_row": int(cd[1]),
                                     "value": float(cd[2]),
                                     "datetime": pd.to_datetime(cd[3]),
                                 }
+                                st.session_state.selected_nir_point = selected_point
+
+                                # High-NIR points open the detailed process check
+                                # on a separate full-width page so the process
+                                # tables and Sterilizer cycle data are readable.
+                                if float(selected_point["value"]) > 4.7:
+                                    st.session_state.pmc_page = "High NIR Process Check"
+                                    st.rerun()
 
                     # ------------------------------------------------
                     # POINT RECOMMENDATION INSIDE THIS PRESS CARD
@@ -2690,8 +3253,11 @@ if page == "Lab Oil Loss – NIR Data Trend":
     # --------------------------------------------------------
     with st.expander("View NIR Sample Data"):
         display_cols = [
+            "sample_id",
             "Date",
             "Sampling Time",
+            "val2",
+            "press_no",
         ] + PRESS_COLS
 
         display_df = filtered[
@@ -2711,7 +3277,59 @@ if page == "Lab Oil Loss – NIR Data Trend":
 
 
 # ============================================================
-# PAGE 2 – OVERALL GRADING
+# DEDICATED HIGH NIR PROCESS CHECK
+# ============================================================
+elif page in {"High NIR Process Check", "Process Confirmation"}:
+    selected = st.session_state.get("selected_nir_point")
+
+    st.markdown(
+        '<div class="main-header">'
+        '<div class="main-header-title">High NIR Process Check</div>'
+        '<div class="main-header-sub">Selected NIR sample → Press & Digester → Sterilizer previous-hour cycle data</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not selected:
+        st.info("Select an NIR data point above 4.7% from the NIR Trend page.")
+        if st.button("← Back to NIR Trend", key="back_high_nir_empty"):
+            st.session_state.pmc_page = "Lab Oil Loss – NIR Data Trend"
+            st.rerun()
+    else:
+        selected_value = float(selected.get("value", 0))
+        if selected_value <= 4.7:
+            st.info(f"Selected NIR value is {selected_value:.2f}%, so the high-NIR process check is only shown for values above 4.70%.")
+            if st.button("← Back to NIR Trend", key="back_high_nir_normal"):
+                st.session_state.pmc_page = "Lab Oil Loss – NIR Data Trend"
+                st.rerun()
+        else:
+            press_name = str(selected.get("press", "Press 1"))
+            sample_dt = pd.to_datetime(selected.get("datetime"), errors="coerce")
+
+            b1, b2, b3 = st.columns([1, 1, 4])
+            with b1:
+                if st.button("← Back to NIR Trend", key="back_high_nir"):
+                    st.session_state.pmc_page = "Lab Oil Loss – NIR Data Trend"
+                    st.rerun()
+            with b2:
+                st.metric("NIR Oil Loss", f"{selected_value:.2f}%")
+            with b3:
+                st.markdown(
+                    f"**{press_name}** · Sample time: **{sample_dt.strftime('%d %b %Y %H:%M:%S') if pd.notna(sample_dt) else '--'}** · "
+                    "High limit: **4.70%**",
+                )
+
+            # Render the same complete process data at full page width.
+            render_high_nir_inline_process_confirmation(
+                selected=selected,
+                press_name=press_name,
+                high_limit=4.7,
+            )
+
+
+# ============================================================
+# ============================================================
+# PAGE 2 – OVERALL GRADING REPORT
 # ============================================================
 elif page == "Overall Grading":
 
@@ -2720,184 +3338,179 @@ elif page == "Overall Grading":
         st.markdown(
             '<div class="main-header">'
             '<div class="main-header-title">Overall Grading Report</div>'
-            '<div class="main-header-sub">Daily average fruit grading percentages from grading_average_data</div>'
+            '<div class="main-header-sub">Daily average fruit grading from grading_average_data</div>'
             '</div>',
             unsafe_allow_html=True,
         )
 
-        st.markdown('<div class="section-heading">Monitoring Period</div>', unsafe_allow_html=True)
-
-        try:
-            engine = get_running_hours_db_engine()
-            available_sql = text("""
-                SELECT MIN(`date`) AS min_date, MAX(`date`) AS max_date
-                FROM `grading_average_data`
-            """)
-            with engine.connect() as conn:
-                available = pd.read_sql(available_sql, conn)
-        except Exception as exc:
-            st.error(f"Unable to read grading date range: {exc}")
-            return
-
-        if available.empty or pd.isna(available.loc[0, "min_date"]):
-            st.warning("No grading-average data is available in grading_average_data.")
-            return
-
-        min_date = pd.to_datetime(available.loc[0, "min_date"]).date()
-        max_date = pd.to_datetime(available.loc[0, "max_date"]).date()
-
-        requested_start = date(2026, 9, 21)
-        requested_end = date(2026, 9, 25)
-        if min_date <= requested_start and max_date >= requested_end:
-            default_start, default_end = requested_start, requested_end
-        else:
-            default_end = max_date
-            default_start = max(min_date, default_end - timedelta(days=4))
-
+        # Date range requested for the daily average grading report.
         f1, f2, f3 = st.columns([1, 1, 2])
         with f1:
-            start_date = st.date_input(
-                "From Date", value=default_start,
-                min_value=min_date, max_value=max_date,
-                key="grading_from_date",
+            grading_start = st.date_input(
+                "From Date",
+                value=date(2026, 9, 21),
+                key="grading_start_date",
             )
         with f2:
-            end_date = st.date_input(
-                "To Date", value=default_end,
-                min_value=min_date, max_value=max_date,
-                key="grading_to_date",
+            grading_end = st.date_input(
+                "To Date",
+                value=date(2026, 9, 25),
+                key="grading_end_date",
             )
         with f3:
-            st.markdown("**Selected period**")
-            st.markdown(
-                f'<div class="small-note">{start_date.strftime("%d %b %Y")} → {end_date.strftime("%d %b %Y")}</div>',
-                unsafe_allow_html=True,
+            if st.button("↻ Refresh Now", key="grading_refresh", use_container_width=True):
+                load_grading_average_data.clear()
+                st.rerun()
+            st.caption(
+                f"Selected period: {grading_start.strftime('%d %b %Y')} → "
+                f"{grading_end.strftime('%d %b %Y')} • Auto-refresh: 20 minutes"
             )
 
-        if start_date > end_date:
-            st.error("From Date cannot be later than To Date.")
+        if grading_start > grading_end:
+            st.warning("From Date must be on or before To Date.")
             return
 
         try:
-            grading = load_grading_average_data(start_date, end_date)
+            grading = load_grading_average_data(grading_start, grading_end)
         except Exception as exc:
-            st.error(f"Unable to load grading data: {exc}")
+            st.error(f"Overall grading database connection failed: {exc}")
             return
 
         if grading.empty:
-            st.warning("No grading records were found for the selected date range.")
+            st.info(
+                f"No grading data found in grading_average_data for "
+                f"{grading_start.strftime('%d %b %Y')} to {grading_end.strftime('%d %b %Y')}."
+            )
             return
 
-        label_map = {
-            "underripe_pct": "Underripe",
-            "ripe_pct": "Ripe",
-            "overripe_pct": "Overripe",
-            "hard_pct": "Hard",
-            "empty_pct": "Empty",
-            "longstalk_pct": "Long Stalk",
-            "unripe_pct": "Unripe",
-        }
-        grading_cols = list(label_map.keys())
+        categories = [
+            ("Underripe", "underripe_pct"),
+            ("Ripe", "ripe_pct"),
+            ("Overripe", "overripe_pct"),
+            ("Hard", "hard_pct"),
+            ("Empty", "empty_pct"),
+            ("Longstalk", "longstalk_pct"),
+            ("Unripe", "unripe_pct"),
+        ]
 
         latest = grading.iloc[-1]
-        st.markdown('<div class="section-heading">Latest Daily Average</div>', unsafe_allow_html=True)
-        kpis = st.columns(4)
-        for i, col in enumerate(grading_cols[:4]):
-            value = latest[col]
-            with kpis[i]:
-                st.markdown(
-                    f'<div class="kpi"><div class="kpi-label">{label_map[col]}</div>'
-                    f'<div class="kpi-value">{value:.2f}%</div>'
-                    f'<div class="small-note">{latest["date"].strftime("%d %b %Y")}</div></div>',
-                    unsafe_allow_html=True,
-                )
 
-        kpis2 = st.columns(3)
-        for i, col in enumerate(grading_cols[4:]):
-            value = latest[col]
-            with kpis2[i]:
-                st.markdown(
-                    f'<div class="kpi"><div class="kpi-label">{label_map[col]}</div>'
-                    f'<div class="kpi-value">{value:.2f}%</div>'
-                    f'<div class="small-note">{latest["date"].strftime("%d %b %Y")}</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-        st.markdown('<div class="section-heading">Daily Average Grading</div>', unsafe_allow_html=True)
-        display_df = grading[["date"] + grading_cols].copy()
-        display_df = display_df.rename(
-            columns={"date": "Date", **{c: label_map[c] + " (%)" for c in grading_cols}}
+        st.markdown(
+            '<div class="section-heading">Latest Daily Average</div>',
+            unsafe_allow_html=True,
         )
-        for col in display_df.columns[1:]:
-            display_df[col] = display_df[col].map(
-                lambda x: round(float(x), 2) if pd.notna(x) else None
-            )
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        card_cols = st.columns(7)
+        for col, (label, field) in zip(card_cols, categories):
+            value = pd.to_numeric(latest[field], errors="coerce")
+            value_text = f"{float(value):.2f}%" if pd.notna(value) else "--"
+            with col:
+                st.markdown(
+                    f'<div class="kpi">'
+                    f'<div class="kpi-label">{label}</div>'
+                    f'<div class="kpi-value">{value_text}</div>'
+                    f'<div class="small-note">{pd.Timestamp(latest["date"]).strftime("%d %b %Y")}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-        st.markdown('<div class="section-heading">Daily Grading Distribution</div>', unsafe_allow_html=True)
+        # Daily average table.
+        st.markdown(
+            '<div class="section-heading">Daily Average Grading</div>',
+            unsafe_allow_html=True,
+        )
+        display = grading.copy()
+        display["date"] = display["date"].dt.strftime("%d-%m-%Y")
+        display.columns = [
+            "Date",
+            "Underripe (%)",
+            "Ripe (%)",
+            "Overripe (%)",
+            "Hard (%)",
+            "Empty (%)",
+            "Longstalk (%)",
+            "Unripe (%)",
+        ]
+        st.dataframe(
+            display.round(2),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Stacked distribution chart.
+        st.markdown(
+            '<div class="section-heading">Daily Grading Distribution</div>',
+            unsafe_allow_html=True,
+        )
         fig = go.Figure()
-        for col in grading_cols:
+        for label, field in categories:
             fig.add_trace(
                 go.Bar(
-                    x=grading["date"].astype(str),
-                    y=grading[col],
-                    name=label_map[col],
-                    hovertemplate=f"{label_map[col]}: %{{y:.2f}}%<extra></extra>",
+                    x=grading["date"],
+                    y=grading[field],
+                    name=label,
+                    hovertemplate=(
+                        f"{label}: %{{y:.2f}}%<br>"
+                        "%{x|%d %b %Y}<extra></extra>"
+                    ),
                 )
             )
         fig.update_layout(
             barmode="stack",
             height=430,
-            margin=dict(l=55, r=25, t=30, b=55),
-            paper_bgcolor="#0b151d",
-            plot_bgcolor="#0b151d",
-            font=dict(color="#dbe5ec"),
-            xaxis=dict(title="Date", gridcolor="#293a46"),
-            yaxis=dict(title="Percentage (%)", gridcolor="#293a46", range=[0, 100]),
-            legend=dict(orientation="h", y=1.08, x=0),
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-
-        st.markdown('<div class="section-heading">Grading Category Trends</div>', unsafe_allow_html=True)
-        trend_fig = go.Figure()
-        for col in grading_cols:
-            trend_fig.add_trace(
-                go.Scatter(
-                    x=grading["date"],
-                    y=grading[col],
-                    mode="lines+markers",
-                    name=label_map[col],
-                    hovertemplate=f"{label_map[col]}: %{{y:.2f}}%<extra></extra>",
-                )
-            )
-        trend_fig.update_layout(
-            height=450,
-            margin=dict(l=55, r=25, t=30, b=55),
+            margin=dict(l=55, r=25, t=45, b=55),
             paper_bgcolor="#0b151d",
             plot_bgcolor="#0b151d",
             font=dict(color="#dbe5ec"),
             xaxis=dict(title="Date", type="date", gridcolor="#293a46"),
-            yaxis=dict(title="Percentage (%)", gridcolor="#293a46", range=[0, 100]),
+            yaxis=dict(title="Percentage (%)", gridcolor="#293a46", zeroline=False),
             legend=dict(orientation="h", y=1.08, x=0),
-            hovermode="x unified",
         )
-        st.plotly_chart(trend_fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
 
-        with st.expander("View Grading DB Data"):
+        # Individual category trends.
+        st.markdown(
+            '<div class="section-heading">Grading Category Trends</div>',
+            unsafe_allow_html=True,
+        )
+        trend_fig = go.Figure()
+        for label, field in categories:
+            trend_fig.add_trace(
+                go.Scatter(
+                    x=grading["date"],
+                    y=grading[field],
+                    mode="lines+markers",
+                    name=label,
+                    hovertemplate=(
+                        f"{label}: %{{y:.2f}}%<br>"
+                        "%{x|%d %b %Y}<extra></extra>"
+                    ),
+                )
+            )
+        trend_fig.update_layout(
+            height=430,
+            margin=dict(l=55, r=25, t=45, b=55),
+            paper_bgcolor="#0b151d",
+            plot_bgcolor="#0b151d",
+            font=dict(color="#dbe5ec"),
+            hovermode="x unified",
+            xaxis=dict(title="Date", type="date", gridcolor="#293a46"),
+            yaxis=dict(title="Percentage (%)", gridcolor="#293a46", zeroline=False),
+            legend=dict(orientation="h", y=1.08, x=0),
+        )
+        st.plotly_chart(
+            trend_fig,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+
+        with st.expander("View Overall Grading DB Data"):
             st.dataframe(grading, use_container_width=True, hide_index=True)
 
     render_overall_grading_page()
-
-
-# ============================================================
-# DEDICATED HIGH OIL LOSS PROCESS CONFIRMATION
-# ============================================================
-elif page == "Process Confirmation":
-    render_process_confirmation_page()
-
-
-# ============================================================
 # PAGE 3 – STERILIZER MONITORING
 # ============================================================
 elif page == "Sterilizer Running Hours":
@@ -3161,111 +3774,284 @@ elif page == "Sterilizer Running Hours":
                     )
 
         # ============================================================
-        # CYCLE-BASED P1 / P2 / P3 / BPV TREND — SEPARATE GRAPH PER STERILIZER
+        # STERILIZER PERFORMANCE — SEPARATE P1 / P2 / P3 / BPV TRENDS
         # ============================================================
-        st.markdown('<div class="section-heading">Sterilizer Cycle Pressure Performance</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-heading">Sterilizer Pressure Trends</div>', unsafe_allow_html=True)
         st.caption(
-            "Each graph shows the recorded P1, P2, P3 and BPV values against cycle number "
-            "for the selected monitoring date range. Sterilizers 1–5 are shown separately."
+            "P1, P2, P3 and BPV are shown as separate trends. "
+            "Each trend includes all Sterilizer 6–10 records found in the "
+            "sterilizer_performance table for the selected calendar dates. "
+            "Duplicate cycle records are retained."
         )
 
         if ster_perf.empty:
-            st.info("No sterilizer performance data is available for the selected period.")
+            st.info(
+                f"No sterilizer performance records were found in sterilizer_performance "
+                f"for {s_date.strftime('%d %b %Y')} to {e_date.strftime('%d %b %Y')}."
+            )
         else:
             perf_graph = ster_perf.copy()
             perf_graph["sterilizer"] = pd.to_numeric(perf_graph["sterilizer"], errors="coerce")
             perf_graph["cycle_no"] = pd.to_numeric(perf_graph["cycle_no"], errors="coerce")
-            perf_graph = perf_graph[perf_graph["sterilizer"].isin(numbers)].copy()
+            perf_graph = perf_graph[perf_graph["sterilizer"].isin([6, 7, 8, 9, 10])].copy()
 
-            # Use the actual cycle reference timestamp for the selected date range.
-            perf_graph["_graph_time"] = pd.to_datetime(perf_graph["cycle_ref_time"], errors="coerce")
+            # IMPORTANT: filter by the actual table date, not cycle_ref_time.
+            # A performance row is considered part of the selected date because
+            # its `date` column belongs to that date.
+            perf_graph["_record_date"] = pd.to_datetime(perf_graph["date"], errors="coerce").dt.date
             perf_graph = perf_graph[
-                perf_graph["_graph_time"].notna()
-                & (perf_graph["_graph_time"] >= pd.Timestamp(start_dt))
-                & (perf_graph["_graph_time"] <= pd.Timestamp(end_dt))
-                & perf_graph["cycle_no"].notna()
+                perf_graph["_record_date"].notna()
+                & (perf_graph["_record_date"] >= s_date)
+                & (perf_graph["_record_date"] <= e_date)
             ].copy()
 
-            for ster_no in numbers:
-                g = perf_graph[perf_graph["sterilizer"] == ster_no].copy()
-                st.markdown(f"### Sterilizer {ster_no} — P1 / P2 / P3 / BPV vs Cycle")
-
-                if g.empty:
-                    st.info(f"No cycle performance records for Sterilizer {ster_no} in the selected date range.")
-                    continue
-
-                # One plotted point per cycle. If the source contains duplicate
-                # records for a cycle, retain the latest performance record.
-                g = (
-                    g.sort_values(["cycle_no", "_graph_time", "id"])
-                     .drop_duplicates(subset=["cycle_no"], keep="last")
-                     .sort_values("cycle_no")
+            if perf_graph.empty:
+                st.info(
+                    f"No Sterilizer 6–10 performance rows match the selected dates "
+                    f"{s_date.strftime('%d %b %Y')} to {e_date.strftime('%d %b %Y')}."
                 )
+            else:
+                # Cycle selector is placed before the four pressure graphs.
+                # Selecting a cycle changes the graphs to show that cycle across
+                # Sterilizers 6–10. This makes it easy to inspect one complete
+                # sterilizer cycle at a time.
+                cycle_values = sorted(
+                    pd.to_numeric(perf_graph["cycle_no"], errors="coerce")
+                    .dropna()
+                    .astype(int)
+                    .unique()
+                    .tolist()
+                )
+                cycle_values = [c for c in cycle_values if 1 <= c <= 30]
+                if not cycle_values:
+                    cycle_values = list(range(1, 31))
 
-                fig_cycle = go.Figure()
+                stored_cycle = st.session_state.get("sterilizer_selected_cycle")
+                default_index = cycle_values.index(int(stored_cycle)) if stored_cycle in cycle_values else 0
+                selected_cycle = st.selectbox(
+                    "Select Cycle",
+                    cycle_values,
+                    index=default_index,
+                    key="sterilizer_cycle_dropdown",
+                    help="Select a cycle to compare P1, P2, P3 and BPV across Sterilizers 6–10.",
+                )
+                st.session_state["sterilizer_selected_cycle"] = int(selected_cycle)
+                st.session_state["sterilizer_selected_sterilizer"] = None
+
+                selected_cycle_df = perf_graph[perf_graph["cycle_no"] == float(selected_cycle)].copy()
+
                 pressure_series = [
                     ("P1", "p1"),
                     ("P2", "p2"),
                     ("P3", "p3"),
                     ("BPV", "back_pressure_receiver"),
                 ]
+
+                # One graph for each pressure parameter. The selected cycle is
+                # shown across Sterilizers 6–10. Duplicate records are retained.
+                selected_sterilizer = None
+
+                marker_symbols = {
+                    6: "circle",
+                    7: "square",
+                    8: "diamond",
+                    9: "triangle-up",
+                    10: "x",
+                }
+
                 for label, column in pressure_series:
-                    y = pd.to_numeric(g[column], errors="coerce")
-                    if y.notna().any():
+                    st.markdown(
+                        f"<div style=\"margin:18px 0 8px 0; font-size:20px; font-weight:700; color:#e8f0f5;\">"
+                        f"{label} <span style=\"color:#718392; font-size:14px; font-weight:500;\">PRESSURE PROFILE · CYCLE 1–30</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    fig_cycle = go.Figure()
+                    plotted_any = False
+
+                    for ster_no in [6, 7, 8, 9, 10]:
+                        g = selected_cycle_df[selected_cycle_df["sterilizer"] == ster_no].copy()
+                        y = pd.to_numeric(g[column], errors="coerce")
+                        valid = y.notna()
+                        g = g.loc[valid].copy()
+                        y = y.loc[valid]
+                        if g.empty:
+                            continue
+
+                        g = g.assign(_value=y.values).sort_values(
+                            ["record_time", "id"],
+                            kind="stable",
+                        )
+                        # Keep every duplicate record. Multiple points for one
+                        # sterilizer/cycle are displayed at the same X position.
                         fig_cycle.add_trace(
                             go.Scatter(
-                                x=g["cycle_no"],
-                                y=y,
-                                mode="lines+markers",
-                                name=label,
-                                connectgaps=False,
-                                hovertemplate=(
-                                    "Cycle %{x}<br>" + label + ": %{y:.2f} PSI<extra></extra>"
+                                x=[f"Sterilizer {ster_no}"] * len(g),
+                                y=g["_value"],
+                                mode="markers",
+                                name=f"Sterilizer {ster_no}",
+                                marker=dict(
+                                    symbol=marker_symbols[ster_no],
+                                    size=11,
+                                    line=dict(width=1),
                                 ),
+                                customdata=g[["sterilizer", "id", "cycle_no", "record_time", "date", "time"]].astype(str).values,
+                                hovertemplate=(
+                                    f"<b>Cycle {int(selected_cycle)} · Sterilizer {ster_no}</b><br>"
+                                    f"{label}: %{{y:.2f}} PSI<br>"
+                                    "Record ID: %{customdata[1]}<br>"
+                                    "Record Time: %{customdata[3]}<extra></extra>"
+                                ),
+                                showlegend=False,
                             )
                         )
+                        plotted_any = True
 
-                fig_cycle.update_layout(
-                    height=390,
-                    margin=dict(l=55, r=25, t=20, b=55),
-                    paper_bgcolor="#0b151d",
-                    plot_bgcolor="#0b151d",
-                    font=dict(color="#dbe5ec"),
-                    hovermode="x unified",
-                    legend=dict(orientation="h", y=1.08, x=0),
-                    xaxis=dict(
-                        title="Cycle Number",
-                        type="linear",
-                        dtick=1 if len(g) <= 20 else None,
-                        gridcolor="#293a46",
-                        zeroline=False,
-                    ),
-                    yaxis=dict(
-                        title="Pressure (PSI)",
-                        gridcolor="#293a46",
-                        zeroline=False,
-                    ),
+                    if not plotted_any:
+                        st.info(f"No {label} values are available for Sterilizers 6–10 in the selected dates.")
+                        continue
+
+                    fig_cycle.update_layout(
+                        height=405,
+                        margin=dict(l=62, r=28, t=48, b=58),
+                        paper_bgcolor="#071018",
+                        plot_bgcolor="#0b151d",
+                        font=dict(color="#dbe5ec", family="Arial"),
+                        hovermode="closest",
+                        hoverlabel=dict(
+                            bgcolor="#111e28",
+                            bordercolor="#415565",
+                            font=dict(color="#eef5f8", size=13),
+                        ),
+                        legend=dict(
+                            orientation="h",
+                            y=1.10,
+                            x=0,
+                            bgcolor="rgba(0,0,0,0)",
+                            font=dict(size=12),
+                        ),
+                        xaxis=dict(
+                            title=dict(text="Sterilizer", font=dict(size=12)),
+                            type="category",
+                            categoryorder="array",
+                            categoryarray=["Sterilizer 6", "Sterilizer 7", "Sterilizer 8", "Sterilizer 9", "Sterilizer 10"],
+                            tickfont=dict(size=10),
+                            gridcolor="#223541",
+                            zeroline=False,
+                            showline=True,
+                            linecolor="#314654",
+                            mirror=False,
+                        ),
+                        yaxis=dict(
+                            title=dict(text=f"{label} Pressure (PSI)", font=dict(size=12)),
+                            gridcolor="#223541",
+                            zeroline=False,
+                            showline=True,
+                            linecolor="#314654",
+                            tickfont=dict(size=10),
+                        ),
+                        shapes=[],
+                    )
+                    chart_event = st.plotly_chart(
+                        fig_cycle,
+                        use_container_width=True,
+                        config={"displaylogo": False},
+                        key=f"sterilizer_pressure_chart_{label}",
+                        on_select="rerun",
+                        selection_mode=("points",),
+                    )
+
+                    # Clicking any point selects its cycle. The selected cycle is
+                    # then used below to show P1 + P2 + P3 + BPV together.
+                    try:
+                        selected_points = chart_event.selection.points if chart_event is not None else []
+                    except Exception:
+                        selected_points = []
+                    if selected_points:
+                        point = selected_points[0]
+                        try:
+                            custom = point.get("customdata") or []
+                            clicked_cycle = int(float(custom[2])) if len(custom) > 2 else int(selected_cycle)
+                            clicked_ster = int(float(custom[0])) if custom else None
+                        except Exception:
+                            clicked_cycle = int(selected_cycle)
+                            clicked_ster = None
+                        st.session_state["sterilizer_selected_cycle"] = clicked_cycle
+                        if clicked_ster is not None:
+                            st.session_state["sterilizer_selected_sterilizer"] = clicked_ster
+
+                # When an operator clicks Cycle 1 (or any cycle), show ALL four
+                # pressure values for that exact sterilizer/cycle. No deduplication
+                # is performed; if multiple rows exist for the same cycle, every
+                # matching row is displayed.
+                selected_cycle = st.session_state.get("sterilizer_selected_cycle")
+                selected_sterilizer = st.session_state.get("sterilizer_selected_sterilizer")
+                if selected_sterilizer is not None and selected_sterilizer not in [6, 7, 8, 9, 10]:
+                    selected_sterilizer = None
+                    st.session_state["sterilizer_selected_sterilizer"] = None
+                if selected_cycle is not None:
+                    detail = perf_graph[perf_graph["cycle_no"] == float(selected_cycle)].copy()
+                    if selected_sterilizer is not None:
+                        detail_ster = detail[detail["sterilizer"] == float(selected_sterilizer)].copy()
+                        if not detail_ster.empty:
+                            detail = detail_ster
+
+                    st.markdown(
+                        f"### Selected Cycle {int(selected_cycle)}" +
+                        (f" — Sterilizer {int(selected_sterilizer)}" if selected_sterilizer is not None else "" )
+                    )
+                    if detail.empty:
+                        st.info(f"No performance record exists for Cycle {int(selected_cycle)} in the selected date range.")
+                    else:
+                        detail = detail.sort_values(["date", "record_time", "sterilizer", "id"], kind="stable")
+                        for _, row in detail.iterrows():
+                            st.markdown(
+                                f"**Sterilizer {int(row['sterilizer'])} · Cycle {int(row['cycle_no'])}** "
+                                f"| P1: **{_format_value(row['p1'], 2, ' PSI')}** "
+                                f"| P2: **{_format_value(row['p2'], 2, ' PSI')}** "
+                                f"| P3: **{_format_value(row['p3'], 2, ' PSI')}** "
+                                f"| BPV: **{_format_value(row['back_pressure_receiver'], 2, ' PSI')}** "
+                                f"| Record ID: **{row['id']}**"
+                            )
+
+                # Complete underlying performance data — no cycle deduplication.
+                st.markdown("### Sterilizer Performance Records")
+                table_df = perf_graph.copy().sort_values(
+                    ["date", "record_time", "sterilizer", "cycle_no", "id"],
+                    kind="stable",
                 )
-                st.plotly_chart(fig_cycle, use_container_width=True, config={"displaylogo": False})
-
-                # Small cycle table below each graph for exact values.
-                graph_table = g[[
-                    "cycle_no", "p1", "p2", "p3", "back_pressure_receiver", "_graph_time"
-                ]].copy()
-                graph_table = graph_table.rename(columns={
+                display_cols = [
+                    "id", "date", "time", "sterilizer", "status", "cycle_no",
+                    "p1", "p2", "p3", "back_pressure_receiver",
+                    "cooking_start_time", "cooking_stop_time",
+                    "door_shut_time", "door_open_time", "insdt"
+                ]
+                display_cols = [c for c in display_cols if c in table_df.columns]
+                display_df = table_df[display_cols].copy()
+                display_df = display_df.rename(columns={
+                    "id": "ID",
+                    "date": "Date",
+                    "time": "Time",
+                    "sterilizer": "Sterilizer",
+                    "status": "Status",
                     "cycle_no": "Cycle",
                     "p1": "P1 (PSI)",
                     "p2": "P2 (PSI)",
                     "p3": "P3 (PSI)",
                     "back_pressure_receiver": "BPV (PSI)",
-                    "_graph_time": "Performance Time",
+                    "cooking_start_time": "Cooking Start",
+                    "cooking_stop_time": "Cooking Stop",
+                    "door_shut_time": "Door Shut",
+                    "door_open_time": "Door Open",
+                    "insdt": "Inserted At",
                 })
-                graph_table["Performance Time"] = pd.to_datetime(
-                    graph_table["Performance Time"], errors="coerce"
-                ).dt.strftime("%d %b %Y %H:%M:%S")
+                for c in ["Date", "Cooking Start", "Cooking Stop", "Door Shut", "Door Open", "Inserted At"]:
+                    if c in display_df.columns:
+                        display_df[c] = pd.to_datetime(display_df[c], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
                 for c in ["P1 (PSI)", "P2 (PSI)", "P3 (PSI)", "BPV (PSI)"]:
-                    graph_table[c] = pd.to_numeric(graph_table[c], errors="coerce").round(2)
-                st.dataframe(graph_table, use_container_width=True, hide_index=True)
+                    if c in display_df.columns:
+                        display_df[c] = pd.to_numeric(display_df[c], errors="coerce").round(2)
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
 
         st.markdown('<div class="section-heading">Valve Status</div>', unsafe_allow_html=True)
         header = '<div class="valve-grid"><div class="valve-head">STERILIZER</div>' + ''.join(f'<div class="valve-head center">{n}</div>' for n in numbers) + '</div>'
@@ -3674,33 +4460,86 @@ elif page == "Clarification Monitoring":
 
             # Trend graphs grouped by process function.
             st.markdown('<div class="section-heading">Clarification Trends</div>', unsafe_allow_html=True)
+
+            # ------------------------------------------------------------
+            # INDIVIDUAL TANK LEVEL TRENDS
+            # Each tank gets its own graph so the level movement can be
+            # monitored independently without overlapping the other tanks.
+            # ------------------------------------------------------------
+            st.markdown("### Tank Level Trends")
+            tank_level_specs = [
+                ("Sludge Tank 1 Level", "sludge_tank_1_level"),
+                ("Sludge Tank 2 Level", "sludge_tank_2_level"),
+                ("Pure Oil Tank 1 Level", "pure_oil_tank_1_level"),
+                ("Pure Oil Tank 2 Level", "pure_oil_tank_2_level"),
+                ("Crude Oil Tank 1-1 Level", "crude_oil_tank_1_1_level"),
+                ("Crude Oil Tank 1-2 Level", "crude_oil_tank_1_2_level"),
+            ]
+            for tank_title, tank_col in tank_level_specs:
+                _add_clarification_chart(
+                    clar,
+                    tank_title,
+                    [(tank_title, tank_col)],
+                    "Level (%)",
+                    height=330,
+                )
+
+            # Vertical clarifier levels are also kept separate from the tank
+            # graphs because they are a different process section.
+            st.markdown("### Vertical Clarifier Level Trends")
             _add_clarification_chart(
                 clar,
-                "Tank Levels",
-                [
-                    ("Sludge Tank 1", "sludge_tank_1_level"),
-                    ("Sludge Tank 2", "sludge_tank_2_level"),
-                    ("Pure Oil Tank 1", "pure_oil_tank_1_level"),
-                    ("Pure Oil Tank 2", "pure_oil_tank_2_level"),
-                    ("Crude Oil Tank 1-1", "crude_oil_tank_1_1_level"),
-                    ("Crude Oil Tank 1-2", "crude_oil_tank_1_2_level"),
-                ],
+                "Vertical Clarifier 1 Level",
+                [("Vertical Clarifier 1", "vertical_clarifier_1_level")],
                 "Level (%)",
+                height=330,
             )
             _add_clarification_chart(
                 clar,
-                "Tank & Clarifier Temperatures",
-                [
-                    ("Sludge Tank 1", "sludge_tank_1_temp"),
-                    ("Sludge Tank 2", "sludge_tank_2_temp"),
-                    ("Pure Oil Tank 1", "pure_oil_tank_1_temp"),
-                    ("Pure Oil Tank 2", "pure_oil_tank_2_temp"),
-                    ("Crude Oil Tank 1-1", "crude_oil_tank_1_1_temp"),
-                    ("Crude Oil Tank 1-2", "crude_oil_tank_1_2_temp"),
-                    ("Vertical Clarifier 1", "vertical_clarifier_1_temp"),
-                    ("Vertical Clarifier 2", "vertical_clarifier_2_temp"),
-                ],
+                "Vertical Clarifier 2 Level",
+                [("Vertical Clarifier 2", "vertical_clarifier_2_level")],
+                "Level (%)",
+                height=330,
+            )
+
+            # ------------------------------------------------------------
+            # INDIVIDUAL TANK / CLARIFIER TEMPERATURE TRENDS
+            # Each temperature gets its own graph, matching the separate
+            # level graphs above. This makes each process temperature easy
+            # to inspect without overlapping multiple temperature series.
+            # ------------------------------------------------------------
+            st.markdown("### Tank & Clarifier Temperature Trends")
+            tank_temperature_specs = [
+                ("Sludge Tank 1 Temperature", "sludge_tank_1_temp"),
+                ("Sludge Tank 2 Temperature", "sludge_tank_2_temp"),
+                ("Pure Oil Tank 1 Temperature", "pure_oil_tank_1_temp"),
+                ("Pure Oil Tank 2 Temperature", "pure_oil_tank_2_temp"),
+                ("Crude Oil Tank 1-1 Temperature", "crude_oil_tank_1_1_temp"),
+                ("Crude Oil Tank 1-2 Temperature", "crude_oil_tank_1_2_temp"),
+            ]
+            for temp_title, temp_col in tank_temperature_specs:
+                _add_clarification_chart(
+                    clar,
+                    temp_title,
+                    [(temp_title, temp_col)],
+                    "Temperature (°C)",
+                    height=330,
+                )
+
+            # Keep the two vertical clarifier temperatures separate as well.
+            _add_clarification_chart(
+                clar,
+                "Vertical Clarifier 1 Temperature",
+                [("Vertical Clarifier 1", "vertical_clarifier_1_temp")],
                 "Temperature (°C)",
+                height=330,
+            )
+            _add_clarification_chart(
+                clar,
+                "Vertical Clarifier 2 Temperature",
+                [("Vertical Clarifier 2", "vertical_clarifier_2_temp")],
+                "Temperature (°C)",
+                height=330,
             )
             _add_clarification_chart(
                 clar,
@@ -3722,15 +4561,38 @@ elif page == "Clarification Monitoring":
             )
             _add_clarification_chart(
                 clar,
-                "Vibrating Screen & Decanter Motor Load",
-                [
-                    ("Vibrating Screen 1", "vibrating_screen_1_amp"),
-                    ("Vibrating Screen 2", "vibrating_screen_2_amp"),
-                    ("Vibrating Screen 3", "vibrating_screen_3_amp"),
-                    ("Decanter 1", "decanter_1_amp"),
-                    ("Decanter 2", "decanter_2_amp"),
-                ],
+                "Vibrating Screen 1 Motor Load",
+                [("Vibrating Screen 1", "vibrating_screen_1_amp")],
                 "Current (A)",
+                height=330,
+            )
+            _add_clarification_chart(
+                clar,
+                "Vibrating Screen 2 Motor Load",
+                [("Vibrating Screen 2", "vibrating_screen_2_amp")],
+                "Current (A)",
+                height=330,
+            )
+            _add_clarification_chart(
+                clar,
+                "Vibrating Screen 3 Motor Load",
+                [("Vibrating Screen 3", "vibrating_screen_3_amp")],
+                "Current (A)",
+                height=330,
+            )
+            _add_clarification_chart(
+                clar,
+                "Decanter 1 Motor Load",
+                [("Decanter 1", "decanter_1_amp")],
+                "Current (A)",
+                height=330,
+            )
+            _add_clarification_chart(
+                clar,
+                "Decanter 2 Motor Load",
+                [("Decanter 2", "decanter_2_amp")],
+                "Current (A)",
+                height=330,
             )
 
             # Statistical analysis without inventing alarm thresholds.
@@ -3846,6 +4708,30 @@ elif page == "Secondary Oil Loss Prediction":
                     unsafe_allow_html=True,
                 )
 
+        if latest_val > SECONDARY_SETLINE:
+            st.markdown(
+                f"""<div class=\"alert-panel\">
+                    <div class=\"alert-title\">⚠ SECONDARY OIL LOSS HIGH ALERT</div>
+                    <div class=\"alert-text\">
+                        Latest NIR: <b>{latest_val:.2f}</b> &nbsp; | &nbsp; Setpoint: <b>{SECONDARY_SETLINE:.2f}</b>
+                        &nbsp; | &nbsp; Difference: <b>{latest_val-SECONDARY_SETLINE:+.2f}</b>
+                    </div>
+                    <div class=\"point-alert-recommendation\" style=\"margin-top:8px;\">
+                        Select an above-setpoint NIR sample to check Press/Digester readings in the same NIR clock hour
+                        and Sterilizer 6–10 cycle readings in the immediately preceding hour.
+                    </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"""<div class=\"point-good\">
+                    <div class=\"point-good-title\">✓ Secondary Oil Loss Within Setpoint</div>
+                    <div class=\"point-good-detail\">Latest NIR {latest_val:.2f} is at/below the fixed {SECONDARY_SETLINE:.2f} setpoint.</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
         st.markdown(
             f'<div class="{status_class}"><b>Current Analysis</b><br>'
             f'Latest sample: <b>{latest_val:.2f}</b> at {latest_time.strftime("%d %b %Y %H:%M:%S")}. '
@@ -3857,10 +4743,16 @@ elif page == "Secondary Oil Loss Prediction":
 
         st.markdown('<div class="section-heading">Secondary Oil Loss Trend</div>', unsafe_allow_html=True)
         fig = go.Figure()
+        sec_plot = sec.copy()
+        sec_customdata = [
+            [int(r["id"]) if pd.notna(r.get("id")) else -1, float(r["val2"]), pd.Timestamp(r["timestamp"]).strftime("%d %b %Y %H:%M:%S")]
+            for _, r in sec_plot.iterrows()
+        ]
         fig.add_trace(go.Scatter(
-            x=sec["timestamp"], y=sec["val2"], mode="lines+markers",
+            x=sec_plot["timestamp"], y=sec_plot["val2"], mode="lines+markers",
             name="NIR Sludge / Pond", line=dict(color="#38bdf8", width=2),
-            marker=dict(size=4),
+            marker=dict(size=5), customdata=sec_customdata,
+            hovertemplate="<b>%{x}</b><br>NIR: %{y:.2f}<br><extra></extra>",
         ))
         fig.add_hline(
             y=SECONDARY_SETLINE, line_dash="dash", line_color="#f97316",
@@ -3874,7 +4766,22 @@ elif page == "Secondary Oil Loss Prediction":
             legend=dict(orientation="h", y=1.05, x=0),
             hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        sec_event = st.plotly_chart(
+            fig, use_container_width=True, config={"displayModeBar": False},
+            key="secondary_nir_trend", on_select="rerun", selection_mode=("points",)
+        )
+        if sec_event and hasattr(sec_event, "selection"):
+            sec_points = sec_event.selection.get("points", [])
+            if sec_points:
+                cd = sec_points[0].get("customdata")
+                if cd and float(cd[1]) > SECONDARY_SETLINE:
+                    st.session_state.selected_secondary_point = {
+                        "id": int(cd[0]),
+                        "value": float(cd[1]),
+                        "datetime": pd.to_datetime(cd[2]),
+                    }
+                    st.session_state.pmc_page = "Secondary High Process Check"
+                    st.rerun()
 
         st.markdown('<div class="section-heading">Trend Analysis</div>', unsafe_allow_html=True)
         a, b, c = st.columns(3)
@@ -3908,6 +4815,390 @@ elif page == "Secondary Oil Loss Prediction":
 
     render_secondary_page()
 
+
+# ============================================================
+# SECONDARY HIGH NIR PROCESS CHECK
+# ============================================================
+elif page == "Secondary High Process Check":
+    selected = st.session_state.get("selected_secondary_point")
+    st.markdown(
+        '<div class="main-header"><div class="main-header-title">Secondary High NIR Process Check</div>'
+        '<div class="main-header-sub">Selected pond NIR → Clarification process data from the same NIR clock hour</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not selected:
+        st.info("Select an above-setpoint Secondary Oil Loss NIR point first.")
+        if st.button("← Back to Secondary Oil Loss", key="back_secondary_empty"):
+            st.session_state.pmc_page = "Secondary Oil Loss Prediction"
+            st.rerun()
+    else:
+        value = float(selected.get("value", 0))
+        sample_dt = pd.to_datetime(selected.get("datetime"), errors="coerce")
+
+        if pd.isna(sample_dt):
+            st.error("Selected Secondary NIR sample has no valid timestamp.")
+        elif value <= SECONDARY_SETLINE:
+            st.info(f"Selected value {value:.2f} is not above the {SECONDARY_SETLINE:.2f} setpoint.")
+            if st.button("← Back to Secondary Oil Loss", key="back_secondary_not_high"):
+                st.session_state.pmc_page = "Secondary Oil Loss Prediction"
+                st.rerun()
+        else:
+            # ------------------------------------------------------------
+            # Selected NIR summary
+            # ------------------------------------------------------------
+            b1, b2, b3, b4 = st.columns(4)
+            with b1:
+                st.metric("NIR Oil Loss", f"{value:.2f}")
+            with b2:
+                st.metric("Setpoint", f"{SECONDARY_SETLINE:.2f}")
+            with b3:
+                st.metric("Above Setpoint", f"{value-SECONDARY_SETLINE:+.2f}")
+            with b4:
+                st.metric("Sample Time", sample_dt.strftime("%d %b %H:%M:%S"))
+
+            if st.button("← Back to Secondary Oil Loss", key="back_secondary_process"):
+                st.session_state.pmc_page = "Secondary Oil Loss Prediction"
+                st.rerun()
+
+            # ------------------------------------------------------------
+            # CLARIFICATION ONLY
+            # Use the full clarification-station history in the 5 hours
+            # immediately preceding the selected Secondary NIR sample.
+            # This gives enough process history around the NIR event instead
+            # of limiting the analysis to one clock hour.
+            # No Press, Digester or Sterilizer data is loaded here.
+            # ------------------------------------------------------------
+            st.markdown(
+                '<div class="section-heading">Clarification Performance — Previous 5 Hours</div>',
+                unsafe_allow_html=True,
+            )
+            window_end = sample_dt
+            window_start = sample_dt - pd.Timedelta(hours=5)
+            st.caption(
+                f"Clarification analysis window: {window_start.strftime('%d %b %Y %H:%M:%S')}–"
+                f"{window_end.strftime('%d %b %Y %H:%M:%S')} "
+                f"(full clarification-station history in the 5 hours leading up to the selected Secondary NIR sample)."
+            )
+
+            try:
+                clar_high = load_clarification_db(window_start, window_end)
+            except Exception as exc:
+                clar_high = pd.DataFrame()
+                st.error(f"Clarification data could not be loaded: {exc}")
+
+            if clar_high.empty:
+                st.warning(
+                    "No clarification-station records were found in the 5-hour window before the selected NIR sample."
+                )
+            else:
+                clar_high = clar_high.sort_values("ts_local").reset_index(drop=True)
+                latest = clar_high.iloc[-1]
+
+                st.markdown(
+                    '<div class="section-heading">Latest Clarification Snapshot</div>',
+                    unsafe_allow_html=True,
+                )
+
+                snapshot_specs = [
+                    ("Sludge Tank 1 Level", "sludge_tank_1_level", "%"),
+                    ("Sludge Tank 1 Temp", "sludge_tank_1_temp", "°C"),
+                    ("Sludge Tank 2 Level", "sludge_tank_2_level", "%"),
+                    ("Sludge Tank 2 Temp", "sludge_tank_2_temp", "°C"),
+                    ("Pure Oil Tank 1 Level", "pure_oil_tank_1_level", "%"),
+                    ("Pure Oil Tank 1 Temp", "pure_oil_tank_1_temp", "°C"),
+                    ("Pure Oil Tank 2 Level", "pure_oil_tank_2_level", "%"),
+                    ("Pure Oil Tank 2 Temp", "pure_oil_tank_2_temp", "°C"),
+                    ("Crude Oil Tank 1-1 Level", "crude_oil_tank_1_1_level", "%"),
+                    ("Crude Oil Tank 1-1 Temp", "crude_oil_tank_1_1_temp", "°C"),
+                    ("Crude Oil Tank 1-2 Level", "crude_oil_tank_1_2_level", "%"),
+                    ("Crude Oil Tank 1-2 Temp", "crude_oil_tank_1_2_temp", "°C"),
+                    ("Vertical Clarifier 1 Level", "vertical_clarifier_1_level", "%"),
+                    ("Vertical Clarifier 1 Temp", "vertical_clarifier_1_temp", "°C"),
+                    ("Vertical Clarifier 2 Level", "vertical_clarifier_2_level", "%"),
+                    ("Vertical Clarifier 2 Temp", "vertical_clarifier_2_temp", "°C"),
+                    ("Vacuum Dryer 1 Pressure", "vacuum_dryer_1_pressure", ""),
+                    ("Vacuum Dryer 2 Pressure", "vacuum_dryer_2_pressure", ""),
+                    ("Vibrating Screen 1", "vibrating_screen_1_amp", "A"),
+                    ("Vibrating Screen 2", "vibrating_screen_2_amp", "A"),
+                    ("Vibrating Screen 3", "vibrating_screen_3_amp", "A"),
+                    ("Decanter 1", "decanter_1_amp", "A"),
+                    ("Decanter 2", "decanter_2_amp", "A"),
+                ]
+
+                snap_cols = st.columns(4)
+                for idx, (label, col_name, unit) in enumerate(snapshot_specs):
+                    raw = latest.get(col_name)
+                    num = pd.to_numeric(raw, errors="coerce")
+                    if pd.notna(num):
+                        value_text = f"{float(num):.1f}{unit}"
+                    elif pd.notna(raw):
+                        value_text = str(raw)
+                    else:
+                        value_text = "--"
+                    with snap_cols[idx % 4]:
+                        st.metric(label, value_text)
+
+                st.caption(
+                    f"{len(clar_high):,} clarification records found in the 5-hour NIR window. "
+                    f"Latest clarification record: {latest['ts_local']:%d %b %Y %H:%M:%S}."
+                )
+
+                # ------------------------------------------------------------
+                # THRESHOLD / EQUIPMENT CHECK
+                # Level: count hours above 90%.
+                # Temperature: count hours above 70°C.
+                # Motor equipment: >5 A is treated as RUNNING, consistent with
+                # the Press page running-current rule.
+                # ------------------------------------------------------------
+                st.markdown(
+                    '<div class="section-heading">Clarification Threshold & Equipment Check</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    "Analysis covers the same 5-hour window. Hours are estimated from consecutive DB readings; "
+                    "gaps longer than 15 minutes are not counted as continuous condition. "
+                    "Level threshold: >90%. Temperature threshold: >70°C. Motor running threshold: >5 A."
+                )
+
+                level_specs = [
+                    ("Sludge Tank 1", "sludge_tank_1_level"),
+                    ("Sludge Tank 2", "sludge_tank_2_level"),
+                    ("Pure Oil Tank 1", "pure_oil_tank_1_level"),
+                    ("Pure Oil Tank 2", "pure_oil_tank_2_level"),
+                    ("Crude Oil Tank 1-1", "crude_oil_tank_1_1_level"),
+                    ("Crude Oil Tank 1-2", "crude_oil_tank_1_2_level"),
+                    ("Vertical Clarifier 1", "vertical_clarifier_1_level"),
+                    ("Vertical Clarifier 2", "vertical_clarifier_2_level"),
+                ]
+                temp_specs = [
+                    ("Sludge Tank 1", "sludge_tank_1_temp"),
+                    ("Sludge Tank 2", "sludge_tank_2_temp"),
+                    ("Pure Oil Tank 1", "pure_oil_tank_1_temp"),
+                    ("Pure Oil Tank 2", "pure_oil_tank_2_temp"),
+                    ("Crude Oil Tank 1-1", "crude_oil_tank_1_1_temp"),
+                    ("Crude Oil Tank 1-2", "crude_oil_tank_1_2_temp"),
+                    ("Vertical Clarifier 1", "vertical_clarifier_1_temp"),
+                    ("Vertical Clarifier 2", "vertical_clarifier_2_temp"),
+                ]
+                motor_specs = [
+                    ("Vibrating Screen 1", "vibrating_screen_1_amp"),
+                    ("Vibrating Screen 2", "vibrating_screen_2_amp"),
+                    ("Vibrating Screen 3", "vibrating_screen_3_amp"),
+                    ("Decanter 1", "decanter_1_amp"),
+                    ("Decanter 2", "decanter_2_amp"),
+                ]
+
+                level_rows = []
+                for label, col_name in level_specs:
+                    latest_value = pd.to_numeric(latest.get(col_name), errors="coerce")
+                    hours = _clarification_duration_above_threshold(
+                        clar_high, col_name, 90.0, window_start, window_end
+                    )
+                    level_rows.append({
+                        "Equipment": label,
+                        "Latest Level (%)": f"{float(latest_value):.1f}" if pd.notna(latest_value) else "--",
+                        "Hours Above 90%": f"{hours:.2f}",
+                    })
+
+                st.markdown("**Level condition — above 90%**")
+                st.dataframe(pd.DataFrame(level_rows), use_container_width=True, hide_index=True)
+
+                temp_rows = []
+                for label, col_name in temp_specs:
+                    latest_value = pd.to_numeric(latest.get(col_name), errors="coerce")
+                    hours = _clarification_duration_above_threshold(
+                        clar_high, col_name, 70.0, window_start, window_end
+                    )
+                    temp_rows.append({
+                        "Equipment": label,
+                        "Latest Temperature (°C)": f"{float(latest_value):.1f}" if pd.notna(latest_value) else "--",
+                        "Hours Above 70°C": f"{hours:.2f}",
+                    })
+
+                st.markdown("**Temperature condition — above 70°C**")
+                st.dataframe(pd.DataFrame(temp_rows), use_container_width=True, hide_index=True)
+
+                motor_rows = []
+                for label, col_name in motor_specs:
+                    running, amp_value, hours = _clarification_running_status(
+                        clar_high, col_name, window_start, window_end, amp_threshold=5.0
+                    )
+                    motor_rows.append({
+                        "Equipment": label,
+                        "Latest Current (A)": f"{amp_value:.1f}" if amp_value is not None else "--",
+                        "Current Status": "RUNNING" if running else "STOPPED",
+                        "Running Hours (5h Window)": f"{hours:.2f}",
+                    })
+
+                st.markdown("**Vibrating Screen & Decanter Running Check**")
+                st.dataframe(pd.DataFrame(motor_rows), use_container_width=True, hide_index=True)
+
+                # Full record history is retained so the user can see exactly
+                # what clarification readings existed around the high NIR sample.
+                st.markdown(
+                    '<div class="section-heading">All Clarification Records — Previous 5 Hours</div>',
+                    unsafe_allow_html=True,
+                )
+                display_cols = [
+                    "ts_local",
+                    "sludge_tank_1_level", "sludge_tank_1_temp",
+                    "sludge_tank_2_level", "sludge_tank_2_temp",
+                    "pure_oil_tank_1_level", "pure_oil_tank_1_temp",
+                    "pure_oil_tank_2_level", "pure_oil_tank_2_temp",
+                    "crude_oil_tank_1_1_level", "crude_oil_tank_1_1_temp",
+                    "crude_oil_tank_1_2_level", "crude_oil_tank_1_2_temp",
+                    "vertical_clarifier_1_level", "vertical_clarifier_1_temp",
+                    "vertical_clarifier_2_level", "vertical_clarifier_2_temp",
+                    "vacuum_dryer_1_pressure", "vacuum_dryer_2_pressure",
+                    "vibrating_screen_1_amp", "vibrating_screen_2_amp",
+                    "vibrating_screen_3_amp", "decanter_1_amp", "decanter_2_amp",
+                ]
+                detail = clar_high[[c for c in display_cols if c in clar_high.columns]].copy()
+                detail = detail.rename(columns={
+                    "ts_local": "Record Time",
+                    "sludge_tank_1_level": "Sludge T1 Level",
+                    "sludge_tank_1_temp": "Sludge T1 Temp",
+                    "sludge_tank_2_level": "Sludge T2 Level",
+                    "sludge_tank_2_temp": "Sludge T2 Temp",
+                    "pure_oil_tank_1_level": "Pure Oil T1 Level",
+                    "pure_oil_tank_1_temp": "Pure Oil T1 Temp",
+                    "pure_oil_tank_2_level": "Pure Oil T2 Level",
+                    "pure_oil_tank_2_temp": "Pure Oil T2 Temp",
+                    "crude_oil_tank_1_1_level": "Crude T1-1 Level",
+                    "crude_oil_tank_1_1_temp": "Crude T1-1 Temp",
+                    "crude_oil_tank_1_2_level": "Crude T1-2 Level",
+                    "crude_oil_tank_1_2_temp": "Crude T1-2 Temp",
+                    "vertical_clarifier_1_level": "Clarifier 1 Level",
+                    "vertical_clarifier_1_temp": "Clarifier 1 Temp",
+                    "vertical_clarifier_2_level": "Clarifier 2 Level",
+                    "vertical_clarifier_2_temp": "Clarifier 2 Temp",
+                    "vacuum_dryer_1_pressure": "Vacuum Dryer 1",
+                    "vacuum_dryer_2_pressure": "Vacuum Dryer 2",
+                    "vibrating_screen_1_amp": "Vib Screen 1",
+                    "vibrating_screen_2_amp": "Vib Screen 2",
+                    "vibrating_screen_3_amp": "Vib Screen 3",
+                    "decanter_1_amp": "Decanter 1",
+                    "decanter_2_amp": "Decanter 2",
+                })
+                detail["Record Time"] = pd.to_datetime(detail["Record Time"], errors="coerce").dt.strftime("%d %b %Y %H:%M:%S")
+                st.dataframe(detail, use_container_width=True, hide_index=True, height=520)
+
+                st.markdown(
+                    '<div class="section-heading">Clarification Trend — Previous 5 Hours</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    "The following trends use the complete clarification-station records from the 5-hour window before the selected NIR sample."
+                )
+
+                # Keep the high-NIR confirmation page readable: group related
+                # clarification signals rather than mixing them with other stations.
+                trend_groups = [
+                    (
+                        "Tank Levels",
+                        [
+                            ("Sludge Tank 1", "sludge_tank_1_level"),
+                            ("Sludge Tank 2", "sludge_tank_2_level"),
+                            ("Pure Oil Tank 1", "pure_oil_tank_1_level"),
+                            ("Pure Oil Tank 2", "pure_oil_tank_2_level"),
+                            ("Crude Oil Tank 1-1", "crude_oil_tank_1_1_level"),
+                            ("Crude Oil Tank 1-2", "crude_oil_tank_1_2_level"),
+                            ("Vertical Clarifier 1", "vertical_clarifier_1_level"),
+                            ("Vertical Clarifier 2", "vertical_clarifier_2_level"),
+                        ],
+                        "%",
+                    ),
+                    (
+                        "Tank Temperatures",
+                        [
+                            ("Sludge Tank 1", "sludge_tank_1_temp"),
+                            ("Sludge Tank 2", "sludge_tank_2_temp"),
+                            ("Pure Oil Tank 1", "pure_oil_tank_1_temp"),
+                            ("Pure Oil Tank 2", "pure_oil_tank_2_temp"),
+                            ("Crude Oil Tank 1-1", "crude_oil_tank_1_1_temp"),
+                            ("Crude Oil Tank 1-2", "crude_oil_tank_1_2_temp"),
+                            ("Vertical Clarifier 1", "vertical_clarifier_1_temp"),
+                            ("Vertical Clarifier 2", "vertical_clarifier_2_temp"),
+                        ],
+                        "°C",
+                    ),
+                ]
+
+                for group_title, specs, unit in trend_groups:
+                    st.markdown(f"**{group_title}**")
+                    for label, col_name in specs:
+                        if col_name not in clar_high.columns:
+                            continue
+                        series = pd.to_numeric(clar_high[col_name], errors="coerce")
+                        if series.notna().sum() == 0:
+                            continue
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=clar_high["ts_local"],
+                            y=series,
+                            mode="lines+markers",
+                            name=label,
+                            line=dict(color="#38bdf8", width=2),
+                            marker=dict(size=5),
+                            hovertemplate=f"<b>{label}</b><br>%{{x}}<br>%{{y:.2f}} {unit}<extra></extra>",
+                        ))
+                        fig.update_layout(
+                            height=250,
+                            paper_bgcolor="#081017",
+                            plot_bgcolor="#081017",
+                            font=dict(color="#dbe5ec"),
+                            margin=dict(l=20, r=20, t=28, b=35),
+                            xaxis=dict(title="Time", showgrid=True, gridcolor="#1d303c"),
+                            yaxis=dict(title=unit, showgrid=True, gridcolor="#1d303c"),
+                            showlegend=False,
+                        )
+                        st.markdown(f"*{label}*")
+                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+                equipment_specs = [
+                    ("Vacuum Dryer 1 Pressure", "vacuum_dryer_1_pressure"),
+                    ("Vacuum Dryer 2 Pressure", "vacuum_dryer_2_pressure"),
+                    ("Vibrating Screen 1", "vibrating_screen_1_amp"),
+                    ("Vibrating Screen 2", "vibrating_screen_2_amp"),
+                    ("Vibrating Screen 3", "vibrating_screen_3_amp"),
+                    ("Decanter 1", "decanter_1_amp"),
+                    ("Decanter 2", "decanter_2_amp"),
+                ]
+                st.markdown("**Clarification Equipment Trends**")
+                for label, col_name in equipment_specs:
+                    if col_name not in clar_high.columns:
+                        continue
+                    series = pd.to_numeric(clar_high[col_name], errors="coerce")
+                    if series.notna().sum() == 0:
+                        continue
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=clar_high["ts_local"],
+                        y=series,
+                        mode="lines+markers",
+                        name=label,
+                        line=dict(color="#22c55e", width=2),
+                        marker=dict(size=5),
+                        hovertemplate=f"<b>{label}</b><br>%{{x}}<br>%{{y:.2f}}<extra></extra>",
+                    ))
+                    fig.update_layout(
+                        height=250,
+                        paper_bgcolor="#081017",
+                        plot_bgcolor="#081017",
+                        font=dict(color="#dbe5ec"),
+                        margin=dict(l=20, r=20, t=28, b=35),
+                        xaxis=dict(title="Time", showgrid=True, gridcolor="#1d303c"),
+                        yaxis=dict(title="Value", showgrid=True, gridcolor="#1d303c"),
+                        showlegend=False,
+                    )
+                    st.markdown(f"*{label}*")
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+            st.caption(
+                "This Secondary Oil Loss process check uses only Clarification-station readings from the same clock hour as the selected pond NIR sample. "
+                "Press, Digester and Sterilizer data are intentionally not shown on this page."
+            )
 
 # ============================================================
 # OTHER PAGES
