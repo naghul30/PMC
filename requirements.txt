@@ -5,3 +5,4 @@ pymysql
 sqlalchemy
 openpyxl
 mysql-connector-python
+lxml
