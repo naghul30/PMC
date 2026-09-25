@@ -2693,7 +2693,7 @@ if page == "Lab Oil Loss – NIR Data Trend":
     with f1:
         start_date = st.date_input(
             "From Date",
-            value=date(2026, 9, 21),
+            value=date(2026, 9, 25),
             key="nir_start_date",
         )
 
