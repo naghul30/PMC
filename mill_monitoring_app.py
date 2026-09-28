@@ -350,6 +350,9 @@ st.markdown(
     .ster-step-guide { color:#b9c8d3; font-size:10px; margin-top:3px; }
     .press-card { background:#08131c; border:1px solid #174b66; border-radius:18px; padding:15px; margin-bottom:12px; }
     .press-card-top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .press-runtime-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:12px 0; }
+    .press-runtime-box { background:#0d1b25; border:1px solid #1b526d; border-radius:12px; padding:10px 12px; }
+    .press-runtime-value { font-size:18px; font-weight:700; color:#f3f4f6; margin-top:3px; }
     .press-name { color:#f8fafc; font-weight:900; font-size:18px; }
     .press-status { padding:6px 10px; border-radius:7px; font-size:11px; font-weight:850; }
     .press-running { background:#0b4f2d; border:1px solid #4ade80; color:#86efac; }
@@ -1420,6 +1423,70 @@ def load_press_trend_db(start_dt, end_dt, press_no):
     return df.dropna(subset=["ts_local"]).sort_values("ts_local")
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_press_daily_running_hours(start_dt, end_dt, max_gap_minutes=15):
+    """Calculate date-selected running hours for Press 1-8 and Digester 1-8.
+
+    Running is defined by motor current > 5 A. Only consecutive DB readings
+    separated by <= 15 minutes contribute to running time, so a missing-data
+    gap is not treated as continuous operation.
+    """
+    engine = get_db_engine()
+    select_cols = ["ts_local"]
+    for i in range(1, 9):
+        select_cols += [f"sp{i}_amp", f"d{i}_amp"]
+
+    sql = text(f"""
+        SELECT {", ".join(select_cols)}
+        FROM pmc_press_station_log
+        WHERE ts_local >= :start_dt
+          AND ts_local <= :end_dt
+        ORDER BY ts_local ASC
+    """)
+
+    with engine.connect() as conn:
+        df = pd.read_sql(sql, conn, params={"start_dt": start_dt, "end_dt": end_dt})
+
+    if df.empty:
+        return pd.DataFrame(columns=["Equipment", "Type", "Running Hours", "Running Minutes"])
+
+    df["ts_local"] = pd.to_datetime(df["ts_local"], errors="coerce")
+    df = df.dropna(subset=["ts_local"]).sort_values("ts_local").reset_index(drop=True)
+
+    rows = []
+    max_gap = float(max_gap_minutes) * 60.0
+
+    for i in range(1, 9):
+        for equipment_type, amp_col, name in [
+            ("Press", f"sp{i}_amp", f"Press {i}"),
+            ("Digester", f"d{i}_amp", f"Digester {i}"),
+        ]:
+            if amp_col not in df.columns:
+                continue
+
+            amp = pd.to_numeric(df[amp_col], errors="coerce")
+            current_time = df["ts_local"]
+            next_time = current_time.shift(-1)
+            gap_seconds = (next_time - current_time).dt.total_seconds()
+            running = amp > 5.0
+
+            valid = running & gap_seconds.notna() & (gap_seconds >= 0) & (gap_seconds <= max_gap)
+            minutes = float((gap_seconds.where(valid, 0.0).sum()) / 60.0)
+
+            rows.append({
+                "Equipment": name,
+                "Type": equipment_type,
+                "Running Hours": minutes / 60.0,
+                "Running Minutes": minutes,
+            })
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    return result.sort_values(["Type", "Equipment"]).reset_index(drop=True)
+
+
 def process_alerts_for_press(row, press_no):
     findings = []
     i = int(press_no)
@@ -2191,7 +2258,6 @@ NAV_ITEMS = [
     ("Clarification", "Clarification Monitoring"),
     ("Secondary Oil Loss", "Secondary Oil Loss Prediction"),
 ]
-
 st.markdown("""
 <div class="main-title">
     PMC SmartMill Monitoring System
@@ -2209,7 +2275,6 @@ st.markdown("""
 }
 </style>
 """, unsafe_allow_html=True)
-
 if "pmc_page" not in st.session_state:
     st.session_state.pmc_page = "Lab Oil Loss – NIR Data Trend"
 if "pmc_settings" not in st.session_state:
@@ -4133,6 +4198,79 @@ elif page == "Press Running Hours":
         latest_time = pd.to_datetime(latest.get("ts_local"), errors="coerce")
         st.caption(f"Latest DB sample: {latest_time.strftime('%d/%m/%Y %I:%M:%S %p') if pd.notna(latest_time) else '--'}")
 
+        # --------------------------------------------------------
+        # DATE-SELECTED RUNNING HOURS
+        # Only equipment that actually ran during the selected period
+        # is shown. Press and Digester use the same >5 A rule.
+        # --------------------------------------------------------
+        try:
+            running_hours_df = load_press_daily_running_hours(start_dt, end_dt)
+        except Exception as exc:
+            st.error(f"Could not calculate Press/Digester running hours: {exc}")
+            running_hours_df = pd.DataFrame()
+
+        running_press_numbers = []
+        running_digester_numbers = []
+        if not running_hours_df.empty:
+            for _, rh in running_hours_df.iterrows():
+                if float(rh.get("Running Hours", 0) or 0) > 0:
+                    match = re.search(r"(\d+)$", str(rh.get("Equipment", "")))
+                    if not match:
+                        continue
+                    number = int(match.group(1))
+                    if rh.get("Type") == "Press":
+                        running_press_numbers.append(number)
+                    elif rh.get("Type") == "Digester":
+                        running_digester_numbers.append(number)
+
+        running_press_numbers = sorted(set(running_press_numbers))
+        running_digester_numbers = sorted(set(running_digester_numbers))
+
+        # --------------------------------------------------------
+        # DATE-SELECTED RUNNING HOURS
+        # Running time is shown inside each corresponding Press card.
+        # This avoids a separate Running Presses / Running Digesters
+        # section and keeps the Press + Digester relationship together.
+        # --------------------------------------------------------
+        active_df = pd.DataFrame()
+        press_hours = {}
+        digester_hours = {}
+
+        if not running_hours_df.empty:
+            active_df = running_hours_df[running_hours_df["Running Hours"] > 0].copy()
+            for _, rh in active_df.iterrows():
+                match = re.search(r"(\d+)$", str(rh.get("Equipment", "")))
+                if not match:
+                    continue
+                number = int(match.group(1))
+                minutes = float(rh.get("Running Minutes", 0) or 0)
+                if rh.get("Type") == "Press":
+                    press_hours[number] = minutes
+                elif rh.get("Type") == "Digester":
+                    digester_hours[number] = minutes
+
+        # Only show digesters corresponding to the Presses that actually ran.
+        corresponding_digester_hours = {
+            number: digester_hours[number]
+            for number in running_press_numbers
+            if number in digester_hours and digester_hours[number] > 0
+        }
+
+        def format_runtime(total_minutes):
+            total_minutes = max(0, int(round(float(total_minutes or 0))))
+            hours, minutes = divmod(total_minutes, 60)
+            return f"{hours} hr {minutes:02d} min"
+
+        st.markdown('<div class="section-heading">Selected Date Running Hours</div>', unsafe_allow_html=True)
+        st.caption(
+            f"{p_date.strftime('%d %b %Y')} to {q_date.strftime('%d %b %Y')} • "
+            "Running = motor current > 5 A • gaps over 15 minutes are not counted. "
+            "Each Press card below shows that Press's total running time for the selected period."
+        )
+
+        if not running_press_numbers:
+            st.info("No Press running activity was detected for the selected date/period.")
+
         # A press is considered running from its main press motor current.
         # 5 A avoids treating tiny/noise current as a running press.
         RUNNING_AMP_THRESHOLD = 5.0
@@ -4163,228 +4301,263 @@ elif page == "Press Running Hours":
         k3.metric("Manual Running", str(manual_count))
         k4.metric("Stopped", str(8 - running_count))
 
-        # 4 x 2 press cards.
-        for row_numbers in ([1,2], [3,4], [5,6], [7,8]):
-            cols = st.columns(2)
-            for idx, i in enumerate(row_numbers):
-                with cols[idx]:
-                    amp = pd.to_numeric(latest.get(f"sp{i}_amp"), errors="coerce")
-                    setpoint = pd.to_numeric(latest.get(f"sp{i}_setpoint"), errors="coerce")
-                    dtemp = pd.to_numeric(latest.get(f"d{i}_temp"), errors="coerce")
-                    damp = pd.to_numeric(latest.get(f"d{i}_amp"), errors="coerce")
-                    level_raw = latest.get(f"d{i}_level")
-                    level_numeric = pd.to_numeric(level_raw, errors="coerce")
-                    hpu = pd.to_numeric(latest.get(f"sp{i}_hpu_pressure"), errors="coerce")
+        # Show only the presses that actually ran during the selected date/period.
+        # This prevents stopped/non-corresponding presses from appearing when a
+        # historical date is selected.
+        if not running_press_numbers:
+            st.info("No corresponding running Press was found for the selected date/period.")
+        else:
+            for start in range(0, len(running_press_numbers), 2):
+                row_numbers = running_press_numbers[start:start + 2]
+                cols = st.columns(len(row_numbers))
+                for idx, i in enumerate(row_numbers):
+                    with cols[idx]:
+                        amp = pd.to_numeric(latest.get(f"sp{i}_amp"), errors="coerce")
+                        setpoint = pd.to_numeric(latest.get(f"sp{i}_setpoint"), errors="coerce")
+                        dtemp = pd.to_numeric(latest.get(f"d{i}_temp"), errors="coerce")
+                        damp = pd.to_numeric(latest.get(f"d{i}_amp"), errors="coerce")
+                        level_raw = latest.get(f"d{i}_level")
+                        level_numeric = pd.to_numeric(level_raw, errors="coerce")
+                        hpu = pd.to_numeric(latest.get(f"sp{i}_hpu_pressure"), errors="coerce")
+                        hpu_psi = pd.to_numeric(latest.get(f"sp{i}_hpu_pressure"), errors="coerce")
+                        hpu_bar = hpu_psi / 14.504 if pd.notna(hpu_psi) else float("nan")
 
-                    # Read the AUTO/MANUAL value directly from this press's own DB column.
-                    mode_raw = latest.get(f"sp{i}_auto_manual")
-                    mode_text = str(mode_raw).strip().upper() if pd.notna(mode_raw) else ""
-                    if mode_text in {"1", "1.0", "AUTO", "AUTOMATIC", "A"}:
-                        mode = "AUTO"
-                    elif mode_text in {"0", "0.0", "MANUAL", "M", "HAND"}:
-                        mode = "MANUAL"
-                    else:
-                        mode = mode_text if mode_text and mode_text not in {"NAN", "NONE", "NULL"} else "UNKNOWN"
+                        # Read the AUTO/MANUAL value directly from this press's own DB column.
+                        mode_raw = latest.get(f"sp{i}_auto_manual")
+                        mode_text = str(mode_raw).strip().upper() if pd.notna(mode_raw) else ""
+                        if mode_text in {"1", "1.0", "AUTO", "AUTOMATIC", "A"}:
+                            mode = "AUTO"
+                        elif mode_text in {"0", "0.0", "MANUAL", "M", "HAND"}:
+                            mode = "MANUAL"
+                        else:
+                            mode = mode_text if mode_text and mode_text not in {"NAN", "NONE", "NULL"} else "UNKNOWN"
 
-                    is_running = pd.notna(amp) and amp > RUNNING_AMP_THRESHOLD
-                    status_text = "RUNNING" if is_running else "STOPPED"
-                    status_class = "press-running" if is_running else "press-stopped"
-                    mode_class = "press-auto" if mode == "AUTO" else "press-manual" if mode == "MANUAL" else ""
+                        is_running = pd.notna(amp) and amp > RUNNING_AMP_THRESHOLD
+                        status_text = "RUNNING" if is_running else "STOPPED"
+                        status_class = "press-running" if is_running else "press-stopped"
+                        mode_class = "press-auto" if mode == "AUTO" else "press-manual" if mode == "MANUAL" else ""
 
-                    # Digester level analysis: explicitly show whether it is above or below 75%.
-                    # Digester level can be stored either as a numeric percentage
-                    # or as the MQTT text values "full" / "not-full".
-                    level_text = str(level_raw).strip().lower() if pd.notna(level_raw) else ""
-                    if pd.notna(level_numeric):
-                        if level_numeric > 75:
+                        # Digester level analysis: explicitly show whether it is above or below 75%.
+                        # Digester level can be stored either as a numeric percentage
+                        # or as the MQTT text values "full" / "not-full".
+                        level_text = str(level_raw).strip().lower() if pd.notna(level_raw) else ""
+                        if pd.notna(level_numeric):
+                            if level_numeric > 75:
+                                level_state = "LEVEL ABOVE 75%"
+                                level_class = "press-level-high"
+                            elif level_numeric < 75:
+                                level_state = "LEVEL BELOW 75%"
+                                level_class = "press-level-low"
+                            else:
+                                level_state = "LEVEL AT 75%"
+                                level_class = "press-level-at"
+                        elif level_text in {"full", "high", "above 75", "above 75%"}:
                             level_state = "LEVEL ABOVE 75%"
                             level_class = "press-level-high"
-                        elif level_numeric < 75:
+                        elif level_text in {"not-full", "not full", "low", "below 75", "below 75%"}:
                             level_state = "LEVEL BELOW 75%"
                             level_class = "press-level-low"
                         else:
-                            level_state = "LEVEL AT 75%"
-                            level_class = "press-level-at"
-                    elif level_text in {"full", "high", "above 75", "above 75%"}:
-                        level_state = "LEVEL ABOVE 75%"
-                        level_class = "press-level-high"
-                    elif level_text in {"not-full", "not full", "low", "below 75", "below 75%"}:
-                        level_state = "LEVEL BELOW 75%"
-                        level_class = "press-level-low"
-                    else:
-                        level_state = "LEVEL: --"
-                        level_class = ""
+                            level_state = "LEVEL: --"
+                            level_class = ""
 
-                    if not is_running:
-                        analysis = "Press is stopped based on motor current."
-                    else:
-                        analysis = f"Press is running in {mode} mode. Digester level is {level_state.replace('LEVEL ', '').lower()}."
+                        if not is_running:
+                            analysis = "Press is stopped based on motor current."
+                        else:
+                            analysis = f"Press is running in {mode} mode. Digester level is {level_state.replace('LEVEL ', '').lower()}."
 
-                    ts_text = latest_time.strftime("%d %b %Y %H:%M:%S") if pd.notna(latest_time) else "--"
+                        ts_text = latest_time.strftime("%d %b %Y %H:%M:%S") if pd.notna(latest_time) else "--"
 
-                    def fmt(v, unit):
-                        return f"{v:.1f} {unit}" if pd.notna(v) else "--"
+                        def fmt(v, unit):
+                            return f"{v:.1f} {unit}" if pd.notna(v) else "--"
 
-                    metrics = [
-                        ("MODE", mode),
-                        ("SETPOINT", fmt(setpoint, "")),
-                        ("MOTOR AMPS", fmt(amp, "A")),
-                        ("DIGESTER TEMP", fmt(dtemp, "°C")),
-                        ("DIGESTER AMPS", fmt(damp, "A")),
-                        ("HYDRAULIC", fmt(hpu, "bar")),
-                    ]
-                    metric_html = "".join(
-                        f'<div class="press-metric"><div class="press-label">{lab}</div><div class="press-value">{val}</div></div>'
-                        for lab, val in metrics
-                    )
+                        press_runtime = press_hours.get(i, 0)
+                        digester_runtime = digester_hours.get(i, 0)
+                        press_runtime_text = format_runtime(press_runtime)
+                        digester_runtime_text = format_runtime(digester_runtime)
 
-                    st.markdown(
-                        f'<div class="press-card">'
-                        f'<div class="press-card-top"><div class="press-name">PRESS {i}</div>'
-                        f'<div class="press-status {status_class}">{status_text}</div></div>'
-                        f'<div class="press-time">◷ {ts_text} &nbsp; • &nbsp; MODE: <span class="{mode_class}">{mode}</span></div>'
-                        f'<div class="press-grid">{metric_html}</div>'
-                        f'<div class="press-level-status {level_class}">{level_state}</div>'
-                        f'<div class="press-analysis"><b>Current Analysis</b><br>{analysis}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+                        metrics = [
+                            ("MODE", mode),
+                            ("SETPOINT", fmt(setpoint, "")),
+                            ("MOTOR AMPS", fmt(amp, "A")),
+                            ("DIGESTER TEMP", fmt(dtemp, "°C")),
+                            ("DIGESTER AMPS", fmt(damp, "A")),
+                            ("HYDRAULIC", fmt(hpu_bar, "bar")),
+                        ]
+                        metric_html = "".join(
+                            f'<div class="press-metric"><div class="press-label">{lab}</div><div class="press-value">{val}</div></div>'
+                            for lab, val in metrics
+                        )
+
+                        st.markdown(
+                            f'<div class="press-card">'
+                            f'<div class="press-card-top"><div class="press-name">PRESS {i}</div>'
+                            f'<div class="press-status {status_class}">{status_text}</div></div>'
+                            f'<div class="press-time">◷ {ts_text} &nbsp; • &nbsp; MODE: <span class="{mode_class}">{mode}</span></div>'
+                            f'<div class="press-runtime-row">'
+                            f'<div class="press-runtime-box"><div class="press-label">RUNNING HOURS</div><div class="press-runtime-value">{press_runtime_text}</div></div>'
+                            f'<div class="press-runtime-box"><div class="press-label">DIGESTER RUNNING</div><div class="press-runtime-value">{digester_runtime_text if digester_runtime > 0 else "Not running"}</div></div>'
+                            f'</div>'
+                            f'<div class="press-grid">{metric_html}</div>'
+                            f'<div class="press-level-status {level_class}">{level_state}</div>'
+                            f'<div class="press-analysis"><b>Current Analysis</b><br>{analysis}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
 
         # ========================================================
-        # DIGESTER PERFORMANCE TREND – COMPLETE START-TO-END HISTORY
+        # DIGESTER PERFORMANCE TREND – ALL RUNNING DIGESTERS
         # ========================================================
         st.markdown(
             '<div class="section-heading">Digester Performance Trend</div>',
             unsafe_allow_html=True,
         )
         st.caption(
-            "Complete selected-period history for digester temperature and level. "
-            "The graph includes every available DB timestamp from the selected start to end date."
+            "Complete selected-period history for every digester corresponding to a Press that ran "
+            "during the selected date/period. No individual digester selection is required."
         )
 
-        trend_press = st.selectbox(
-            "Select Press for Digester Trend",
-            [f"Press {i}" for i in range(1, 9)],
-            key="digester_trend_press",
-        )
-        ti = int(trend_press.split()[-1])
-
-        try:
-            trend_df = load_press_trend_db(start_dt, end_dt, ti)
-        except Exception as exc:
-            st.error(f"Could not load the complete digester trend for Press {ti}: {exc}")
-            trend_df = pd.DataFrame()
-
-        if trend_df.empty:
-            st.info(f"No digester temperature/level data available for Press {ti} in the selected period.")
+        if not running_press_numbers:
+            st.info("No running Press is available for the selected date/period.")
         else:
-            valid_temp = trend_df[trend_df["temperature"].notna()].copy()
-            above = valid_temp[valid_temp["level_state"] == "Above 75%"]
-            below = valid_temp[valid_temp["level_state"] == "Below 75%"]
-            at75 = valid_temp[valid_temp["level_state"] == "At 75%"]
+            for trend_press_num in running_press_numbers:
+                # Press N is paired with Digester N. Only digesters belonging to
+                # presses that actually ran in the selected date/period are shown.
+                trend_digester_num = trend_press_num
 
-            a1, a2, a3, a4 = st.columns(4)
-            a1.metric("Total Readings", f"{len(valid_temp):,}")
-            a2.metric("Above 75%", f"{len(above):,}")
-            a3.metric("Below 75%", f"{len(below):,}")
-            a4.metric("Temperature Range", (
-                f"{valid_temp['temperature'].min():.1f}–{valid_temp['temperature'].max():.1f} °C"
-                if not valid_temp.empty else "--"
-            ))
-
-            # Temperature uses the left axis. Digester level is shown on the right
-            # axis as a state line: 100 = Above 75%, 0 = Below 75%.
-            fig_dt = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_dt.add_trace(
-                go.Scatter(
-                    x=valid_temp["ts_local"],
-                    y=valid_temp["temperature"],
-                    mode="lines",
-                    name="Temperature",
-                    line=dict(width=2.5),
-                    connectgaps=False,
-                    hovertemplate="%{x|%H:%M:%S}<br>Temperature: %{y:.1f} °C<extra></extra>",
-                ),
-                secondary_y=False,
-            )
-
-            level_df = trend_df[trend_df["level_value"].notna()].copy()
-            if not level_df.empty:
-                fig_dt.add_trace(
-                    go.Scatter(
-                        x=level_df["ts_local"],
-                        y=level_df["level_value"],
-                        mode="lines",
-                        name="Level",
-                        line=dict(width=2.5, shape="hv"),
-                        connectgaps=False,
-                        hovertemplate=(
-                            "%{x|%H:%M:%S}<br>Level: "
-                            "%{customdata}<extra></extra>"
-                        ),
-                        customdata=level_df["level_state"],
-                    ),
-                    secondary_y=True,
+                st.markdown(
+                    f'<div class="subsection-heading">Digester {trend_digester_num}</div>',
+                    unsafe_allow_html=True,
                 )
 
-            # Fixed 90°C process reference line, matching the requested style.
-            fig_dt.add_hline(
-                y=90,
-                line_dash="dash",
-                line_width=1.5,
-                annotation_text="Baseline (90°C)",
-                annotation_position="top right",
-                secondary_y=False,
-            )
+                try:
+                    trend_df = load_press_trend_db(start_dt, end_dt, trend_press_num)
+                except Exception as exc:
+                    st.error(
+                        f"Could not load the complete digester trend for Digester "
+                        f"{trend_digester_num}: {exc}"
+                    )
+                    trend_df = pd.DataFrame()
 
-            # Keep the level state readable on the right side.
-            fig_dt.update_yaxes(
-                title_text="Temperature",
-                rangemode="tozero",
-                secondary_y=False,
-            )
-            fig_dt.update_yaxes(
-                title_text="Level",
-                range=[-5, 105],
-                tickmode="array",
-                tickvals=[0, 50, 100],
-                ticktext=["Less than 75", "75%", "Above 75"],
-                secondary_y=True,
-            )
-            fig_dt.update_xaxes(
-                title_text="Time",
-                showgrid=False,
-                rangeslider_visible=True,
-            )
-            fig_dt.update_layout(
-                height=470,
-                margin=dict(l=55, r=65, t=45, b=55),
-                paper_bgcolor="#071018",
-                plot_bgcolor="#071018",
-                font=dict(color="#e5e7eb"),
-                hovermode="x unified",
-                legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center"),
-                xaxis=dict(type="date"),
-            )
-            st.plotly_chart(fig_dt, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
+                if trend_df.empty:
+                    st.info(
+                        f"No digester temperature/level data available for Digester "
+                        f"{trend_digester_num} in the selected period."
+                    )
+                    continue
 
-            st.caption(
-                f"Press {ti}: {len(valid_temp):,} temperature readings from "
-                f"{valid_temp['ts_local'].min():%d/%m/%Y %H:%M:%S} to "
-                f"{valid_temp['ts_local'].max():%d/%m/%Y %H:%M:%S}."
-            )
+                valid_temp = trend_df[trend_df["temperature"].notna()].copy()
+                above = valid_temp[valid_temp["level_state"] == "Above 75%"]
+                below = valid_temp[valid_temp["level_state"] == "Below 75%"]
+                at75 = valid_temp[valid_temp["level_state"] == "At 75%"]
 
-            # Compact level/temperature summary for the same complete dataset.
-            summary_rows = []
-            for state, group in (("Above 75%", above), ("Below 75%", below), ("At 75%", at75)):
-                summary_rows.append({
-                    "Level Condition": state,
-                    "Samples": len(group),
-                    "Avg Temperature (°C)": round(group["temperature"].mean(), 2) if not group.empty else None,
-                    "Min Temperature (°C)": round(group["temperature"].min(), 2) if not group.empty else None,
-                    "Max Temperature (°C)": round(group["temperature"].max(), 2) if not group.empty else None,
-                })
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("Total Readings", f"{len(valid_temp):,}")
+                a2.metric("Above 75%", f"{len(above):,}")
+                a3.metric("Below 75%", f"{len(below):,}")
+                a4.metric(
+                    "Temperature Range",
+                    (
+                        f"{valid_temp['temperature'].min():.1f}–{valid_temp['temperature'].max():.1f} °C"
+                        if not valid_temp.empty else "--"
+                    ),
+                )
+
+                # Temperature uses the left axis. Digester level is shown on the right
+                # axis as a state line: 100 = Above 75%, 0 = Below 75%.
+                fig_dt = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_dt.add_trace(
+                    go.Scatter(
+                        x=valid_temp["ts_local"],
+                        y=valid_temp["temperature"],
+                        mode="lines",
+                        name="Temperature",
+                        line=dict(width=2.5),
+                        connectgaps=False,
+                        hovertemplate="%{x|%H:%M:%S}<br>Temperature: %{y:.1f} °C<extra></extra>",
+                    ),
+                    secondary_y=False,
+                )
+
+                level_df = trend_df[trend_df["level_value"].notna()].copy()
+                if not level_df.empty:
+                    fig_dt.add_trace(
+                        go.Scatter(
+                            x=level_df["ts_local"],
+                            y=level_df["level_value"],
+                            mode="lines",
+                            name="Level",
+                            line=dict(width=2.5, shape="hv"),
+                            connectgaps=False,
+                            hovertemplate=(
+                                "%{x|%H:%M:%S}<br>Level: "
+                                "%{customdata}<extra></extra>"
+                            ),
+                            customdata=level_df["level_state"],
+                        ),
+                        secondary_y=True,
+                    )
+
+                fig_dt.add_hline(
+                    y=90,
+                    line_dash="dash",
+                    line_width=1.5,
+                    annotation_text="Baseline (90°C)",
+                    annotation_position="top right",
+                    secondary_y=False,
+                )
+
+                fig_dt.update_yaxes(
+                    title_text="Temperature",
+                    rangemode="tozero",
+                    secondary_y=False,
+                )
+                fig_dt.update_yaxes(
+                    title_text="Level",
+                    range=[-5, 105],
+                    tickmode="array",
+                    tickvals=[0, 50, 100],
+                    ticktext=["Less than 75", "75%", "Above 75"],
+                    secondary_y=True,
+                )
+                fig_dt.update_xaxes(
+                    title_text="Time",
+                    showgrid=False,
+                    rangeslider_visible=True,
+                )
+                fig_dt.update_layout(
+                    height=470,
+                    margin=dict(l=55, r=65, t=45, b=55),
+                    paper_bgcolor="#071018",
+                    plot_bgcolor="#071018",
+                    font=dict(color="#e5e7eb"),
+                    hovermode="x unified",
+                    legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center"),
+                    xaxis=dict(type="date"),
+                )
+                st.plotly_chart(
+                    fig_dt,
+                    use_container_width=True,
+                    config={"displayModeBar": True, "scrollZoom": True},
+                )
+
+                st.caption(
+                    f"Digester {trend_digester_num}: {len(valid_temp):,} temperature readings from "
+                    f"{valid_temp['ts_local'].min():%d/%m/%Y %H:%M:%S} to "
+                    f"{valid_temp['ts_local'].max():%d/%m/%Y %H:%M:%S}."
+                )
+
+                summary_rows = []
+                for state, group in (("Above 75%", above), ("Below 75%", below), ("At 75%", at75)):
+                    summary_rows.append({
+                        "Level Condition": state,
+                        "Samples": len(group),
+                        "Avg Temperature (°C)": round(group["temperature"].mean(), 2) if not group.empty else None,
+                        "Min Temperature (°C)": round(group["temperature"].min(), 2) if not group.empty else None,
+                        "Max Temperature (°C)": round(group["temperature"].max(), 2) if not group.empty else None,
+                    })
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
 
         with st.expander("View Press DB Data"):
             st.dataframe(press_df, use_container_width=True, hide_index=True)
@@ -4670,6 +4843,7 @@ elif page == "Secondary Oil Loss Prediction":
         c1, c2 = st.columns([1, 5])
         with c1:
             if st.button("↻ Refresh Now", key="secondary_refresh", use_container_width=True):
+                load_secondary_oil_loss.clear()
                 st.rerun()
         with c2:
             st.caption("Auto-refresh: every 20 minutes • Set line: 1.60 • Source: nir_sludge / pond samples")
