@@ -2204,7 +2204,7 @@ st.markdown("""
     font-size: 30px;
     font-weight: 700;
     color: #ffffff;
-    padding: 12px 0 70px 0;
+    padding: 35px 0 18px 0;
     letter-spacing: 0.5px;
 }
 </style>
