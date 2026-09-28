@@ -2192,6 +2192,24 @@ NAV_ITEMS = [
     ("Secondary Oil Loss", "Secondary Oil Loss Prediction"),
 ]
 
+st.markdown("""
+<div class="main-title">
+    PMC SmartMill Monitoring System
+</div>
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+.main-title {
+    text-align: center;
+    font-size: 30px;
+    font-weight: 700;
+    color: #ffffff;
+    padding: 12px 0 18px 0;
+    letter-spacing: 0.5px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 if "pmc_page" not in st.session_state:
     st.session_state.pmc_page = "Lab Oil Loss – NIR Data Trend"
 if "pmc_settings" not in st.session_state:
