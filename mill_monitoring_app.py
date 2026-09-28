@@ -2693,14 +2693,14 @@ if page == "Lab Oil Loss – NIR Data Trend":
     with f1:
         start_date = st.date_input(
             "From Date",
-            value=date(2026, 9, 25),
+            value=date.today(),
             key="nir_start_date",
         )
 
     with f2:
         end_date = st.date_input(
             "To Date",
-            value=date(2026, 9, 25),
+            value=date.today(),
             key="nir_end_date",
         )
 
@@ -3348,13 +3348,13 @@ elif page == "Overall Grading":
         with f1:
             grading_start = st.date_input(
                 "From Date",
-                value=date(2026, 9, 21),
+                value=date.today(),
                 key="grading_start_date",
             )
         with f2:
             grading_end = st.date_input(
                 "To Date",
-                value=date(2026, 9, 25),
+                value=date.today(),
                 key="grading_end_date",
             )
         with f3:
