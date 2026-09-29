@@ -4847,7 +4847,6 @@ elif page == "Secondary Oil Loss Prediction":
         c1, c2 = st.columns([1, 5])
         with c1:
             if st.button("↻ Refresh Now", key="secondary_refresh", use_container_width=True):
-                load_secondary_oil_loss.clear()
                 st.rerun()
         with c2:
             st.caption("Auto-refresh: every 20 minutes • Set line: 1.60 • Source: nir_sludge / pond samples")
