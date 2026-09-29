@@ -2557,6 +2557,10 @@ def render_high_nir_inline_process_confirmation(selected, press_name, high_limit
         st.info(f"No Press {press_no} / Digester records were found in the NIR hour.")
     else:
         press_df = press_df.sort_values("ts_local").copy()
+        press_df["hydraulic_pressure"] = (
+        pd.to_numeric(press_df["hydraulic_pressure"], errors="coerce") / 14.504)
+
+
         latest = press_df.iloc[-1]
 
         latest_dt = pd.to_datetime(latest.get("ts_local"), errors="coerce")
