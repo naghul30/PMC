@@ -482,43 +482,106 @@ def get_running_hours_db_engine():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_running_hours_db():
-    """Load current cumulative running hours for parts/machines assigned to stations."""
+def load_predictive_maintenance_db():
+    """Load predictive-maintenance records with station/location/part names.
+
+    The prediction table is joined to the same station + location + part
+    mapping used by item_station_location. Technical IDs are retained only
+    internally for matching and are never displayed.
+    """
+    engine = get_running_hours_db_engine()
+    sql = text("""
+        SELECT
+            a.*,
+            s.station_name,
+            l.location_name,
+            p.parts_name AS assigned_part
+        FROM ai_prediction_dataset a
+        LEFT JOIN stations s
+            ON a.stationid = s.station_id
+        LEFT JOIN item_station_location isl
+            ON isl.station_id = a.stationid
+           AND isl.location_id = a.machineryid
+           AND isl.item_id = a.partid
+        LEFT JOIN locations l
+            ON isl.location_id = l.location_id
+        LEFT JOIN parts p
+            ON a.partid = p.parts_id
+        ORDER BY a.stationid, a.machineryid, a.partid
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(sql, conn)
+    return df
+
+
+def _prediction_date_column(df):
+    """Find the date field in ai_prediction_dataset without assuming one schema name."""
+    candidates = [
+        "date", "prediction_date", "predicted_date",
+        "maintenance_date", "scheduled_date", "created_at",
+        "timestamp", "ts", "datetime",
+    ]
+    lower_map = {str(c).lower(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate in lower_map:
+            return lower_map[candidate]
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_maintenance_due():
+    """Return only equipment whose current running hours have reached its maintenance limit.
+
+    The maintenance limit (locations.alert_after) is used internally only to
+    decide which rows should be shown. It is never displayed.
+    """
     engine = get_running_hours_db_engine()
     sql = text("""
         SELECT
             s.station_name,
             l.location_name,
-            p.parts_name,
+            p.parts_name AS assigned_part,
             i.machine_running_hours
         FROM item_station_location i
         JOIN stations s ON i.station_id = s.station_id
         JOIN locations l ON i.location_id = l.location_id
         JOIN parts p ON i.item_id = p.parts_id
-        ORDER BY l.location_name, s.station_name, p.parts_name
+        WHERE i.machine_running_hours IS NOT NULL
+          AND l.alert_after IS NOT NULL
+          AND i.machine_running_hours >= l.alert_after
+        ORDER BY s.station_name, l.location_name, p.parts_name
     """)
     with engine.connect() as conn:
-        df = pd.read_sql(sql, conn)
-    if not df.empty:
-        df["machine_running_hours"] = pd.to_numeric(df["machine_running_hours"], errors="coerce")
-    return df
+        due = pd.read_sql(sql, conn)
+
+    if not due.empty:
+        due["machine_running_hours"] = pd.to_numeric(
+            due["machine_running_hours"], errors="coerce"
+        )
+        due = due.dropna(subset=["machine_running_hours"])
+    return due
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_machine_running_hours_db():
-    """Load current machine running-hour meters directly from locations."""
+def load_running_hours_db():
+    # IMPORTANT: machine_running_hours comes from the Smart Perak Motor DB.
+    # This is intentionally separate from pmc_mqtt_pmc used for live process data.
     engine = get_running_hours_db_engine()
     sql = text("""
-        SELECT DISTINCT
-            l.location_name,
+        SELECT
+            i.item_station_id AS id,
             s.station_name,
-            l.machine_running_hours
-        FROM locations l
-        LEFT JOIN item_station_location i
-            ON i.location_id = l.location_id
-        LEFT JOIN stations s
-            ON s.station_id = i.station_id
-        ORDER BY l.location_name, s.station_name
+            i.station_id,
+            l.location_name,
+            i.location_id,
+            p.parts_name,
+            i.item_id AS part_id,
+            i.machine_running_hours
+        FROM item_station_location i
+        JOIN stations s ON i.station_id = s.station_id
+        JOIN locations l ON i.location_id = l.location_id
+        JOIN parts p ON i.item_id = p.parts_id
+        ORDER BY s.station_name, p.parts_name
     """)
     with engine.connect() as conn:
         df = pd.read_sql(sql, conn)
@@ -2275,7 +2338,7 @@ NAV_ITEMS = [
     ("Press", "Press Running Hours"),
     ("Clarification", "Clarification Monitoring"),
     ("Secondary Oil Loss", "Secondary Oil Loss Prediction"),
-    ("Maintenance", "Maintenance Running Hours"),
+    ("Maintenance", "Maintenance"),
 ]
 st.markdown("""
 <div class="main-title">
@@ -2300,7 +2363,7 @@ if "pmc_settings" not in st.session_state:
     st.session_state.pmc_settings = False
 
 st.markdown('<div class="top-nav-wrap">', unsafe_allow_html=True)
-nav_cols = st.columns([1.05, 1.2, 1.0, 0.9, 1.05, 1.35, 1.1, 0.5])
+nav_cols = st.columns([1.05, 1.2, 1.0, 0.9, 1.05, 1.35, 1.0, 0.5])
 for idx, (label, target) in enumerate(NAV_ITEMS):
     with nav_cols[idx]:
         st.markdown('<div class="topnav-btn">', unsafe_allow_html=True)
@@ -4848,6 +4911,169 @@ elif page == "Clarification Monitoring":
     render_clarification_page()
 
 
+
+# ============================================================
+# PAGE 7 – MAINTENANCE
+# ============================================================
+elif page == "Maintenance":
+
+    @st.fragment(run_every="1200s")
+    def render_maintenance_page():
+        st.markdown(
+            '<div class="main-header">'
+            '<div class="main-header-title">Maintenance</div>'
+            '<div class="main-header-sub">Running-hour maintenance and predictive maintenance</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        refresh_col, info_col = st.columns([1, 5])
+        with refresh_col:
+            if st.button("↻ Refresh Now", key="maintenance_refresh", use_container_width=True):
+                load_maintenance_due.clear()
+                load_predictive_maintenance_db.clear()
+                st.rerun()
+        with info_col:
+            st.caption(
+                "Auto-refresh: every 20 minutes • Running-hours list shows only equipment that has reached its maintenance limit"
+            )
+
+        # ========================================================
+        # 1. RUNNING-HOURS MAINTENANCE LIST
+        # ========================================================
+        st.markdown(
+            '<div class="section-heading">Running Hours – Maintenance Due</div>',
+            unsafe_allow_html=True,
+        )
+
+        try:
+            maintenance = load_maintenance_due()
+        except Exception as exc:
+            maintenance = pd.DataFrame()
+            st.error(f"Running-hours maintenance data could not be loaded: {exc}")
+
+        if maintenance.empty:
+            st.success("No equipment has reached its maintenance running-hour limit.")
+        else:
+            # Filters apply only to the running-hours maintenance list.
+            f1, f2, f3 = st.columns([1, 1, 1.5])
+            locations = sorted(maintenance["location_name"].dropna().astype(str).unique().tolist())
+            stations = sorted(maintenance["station_name"].dropna().astype(str).unique().tolist())
+
+            with f1:
+                selected_location = st.selectbox(
+                    "Location", ["All Locations"] + locations, key="maintenance_location"
+                )
+            with f2:
+                selected_station = st.selectbox(
+                    "Station", ["All Stations"] + stations, key="maintenance_station"
+                )
+            with f3:
+                search_part = st.text_input(
+                    "Search Assigned Part / Machine",
+                    key="maintenance_part_search",
+                    placeholder="Type part or machine name",
+                )
+
+            filtered = maintenance.copy()
+            if selected_location != "All Locations":
+                filtered = filtered[filtered["location_name"].astype(str) == selected_location]
+            if selected_station != "All Stations":
+                filtered = filtered[filtered["station_name"].astype(str) == selected_station]
+            if search_part.strip():
+                filtered = filtered[
+                    filtered["assigned_part"].astype(str).str.contains(
+                        search_part.strip(), case=False, na=False
+                    )
+                ]
+
+            display = filtered[[
+                "location_name",
+                "station_name",
+                "assigned_part",
+                "machine_running_hours",
+            ]].copy()
+            display = display.rename(columns={
+                "location_name": "Location",
+                "station_name": "Station",
+                "assigned_part": "Assigned Part / Machine",
+                "machine_running_hours": "Running Hours",
+            })
+            display["Running Hours"] = pd.to_numeric(
+                display["Running Hours"], errors="coerce"
+            ).round(1)
+
+            if display.empty:
+                st.info("No maintenance-due equipment matches the selected filters.")
+            else:
+                st.dataframe(
+                    display,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Running Hours": st.column_config.NumberColumn(
+                            "Running Hours", format="%.1f hrs"
+                        ),
+                    },
+                )
+                st.caption(
+                    f"{len(display):,} equipment item(s) shown • Only maintenance-due running-hour records are listed."
+                )
+
+        # ========================================================
+        # 2. PREDICTIVE MAINTENANCE LIST — SEPARATE FROM ABOVE
+        # ========================================================
+        st.markdown(
+            '<div class="section-heading">Predictive Maintenance</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Predictive maintenance assignments are shown separately. "
+            "The assignment is mapped by Station + Location + Assigned Part."
+        )
+
+        try:
+            predictive = load_predictive_maintenance_db()
+        except Exception as exc:
+            predictive = pd.DataFrame()
+            st.error(f"Predictive maintenance data could not be loaded: {exc}")
+
+        if predictive.empty:
+            st.info("No predictive maintenance records are available.")
+        else:
+            pred_date_col = _prediction_date_column(predictive)
+
+            pred_display = pd.DataFrame({
+                "Station": predictive.get("station_name", pd.Series(index=predictive.index, dtype=object)),
+                "Location": predictive.get("location_name", pd.Series(index=predictive.index, dtype=object)),
+                "Assigned Part": predictive.get("assigned_part", pd.Series(index=predictive.index, dtype=object)),
+            })
+
+            if pred_date_col is not None:
+                pred_display["Date"] = pd.to_datetime(
+                    predictive[pred_date_col], errors="coerce"
+                ).dt.strftime("%d-%m-%Y")
+                pred_display["Date"] = pred_display["Date"].fillna("—")
+            else:
+                pred_display["Date"] = "—"
+
+            pred_display = pred_display.drop_duplicates().reset_index(drop=True)
+            pred_display = pred_display[
+                ["Station", "Location", "Assigned Part", "Date"]
+            ]
+
+            st.dataframe(
+                pred_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                f"{len(pred_display):,} predictive maintenance record(s) • Source/technical IDs are hidden."
+            )
+
+    render_maintenance_page()
+
+
 # ============================================================
 # PAGE 6 – SECONDARY OIL LOSS PREDICTION
 # ============================================================
@@ -5412,211 +5638,6 @@ elif page == "Secondary High Process Check":
                 "This Secondary Oil Loss process check uses only Clarification-station readings from the same clock hour as the selected pond NIR sample. "
                 "Press, Digester and Sterilizer data are intentionally not shown on this page."
             )
-
-# ============================================================
-# PAGE – MAINTENANCE RUNNING HOURS
-# ============================================================
-elif page == "Maintenance Running Hours":
-
-    @st.fragment(run_every="1200s")
-    def render_maintenance_running_hours_page():
-        st.markdown(
-            """
-            <div class="main-header">
-                <div class="main-header-title">Maintenance Running Hours</div>
-                <div class="main-header-sub">
-                    Current cumulative running-hour meters for parts and machines
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        refresh_col, info_col = st.columns([1, 4])
-        with refresh_col:
-            if st.button("↻ Refresh Now", key="maintenance_refresh", use_container_width=True):
-                load_running_hours_db.clear()
-                load_machine_running_hours_db.clear()
-                st.rerun()
-        with info_col:
-            st.caption("Auto-refresh: every 20 minutes • Current cumulative running-hour meters")
-
-        try:
-            parts_df = load_running_hours_db()
-            machines_df = load_machine_running_hours_db()
-        except Exception as exc:
-            st.error(f"Maintenance running-hours data could not be loaded: {exc}")
-            parts_df = pd.DataFrame()
-            machines_df = pd.DataFrame()
-
-        def format_hours(value):
-            if pd.isna(value):
-                return "--"
-            total_minutes = max(0, int(round(float(value) * 60)))
-            hours, minutes = divmod(total_minutes, 60)
-            return f"{hours:,} hr {minutes:02d} min"
-
-        # ------------------------------------------------------------
-        # PARTS RUNNING HOURS
-        # ------------------------------------------------------------
-        st.markdown('<div class="section-heading">Parts Running Hours</div>', unsafe_allow_html=True)
-
-        if parts_df.empty:
-            st.info("No parts running-hours records were found.")
-        else:
-            parts_df = parts_df.copy()
-            parts_df["machine_running_hours"] = pd.to_numeric(
-                parts_df["machine_running_hours"], errors="coerce"
-            )
-
-            f1, f2, f3 = st.columns([1, 1, 1.5])
-            location_options = ["All Locations"] + sorted(
-                parts_df["location_name"].dropna().astype(str).unique().tolist()
-            )
-            station_options = ["All Stations"] + sorted(
-                parts_df["station_name"].dropna().astype(str).unique().tolist()
-            )
-            with f1:
-                selected_location = st.selectbox(
-                    "Location", location_options, key="maintenance_parts_location"
-                )
-            with f2:
-                selected_station = st.selectbox(
-                    "Station", station_options, key="maintenance_parts_station"
-                )
-            with f3:
-                part_search = st.text_input(
-                    "Search part / machine",
-                    placeholder="Type part or machine name...",
-                    key="maintenance_part_search",
-                )
-
-            filtered_parts = parts_df.copy()
-            if selected_location != "All Locations":
-                filtered_parts = filtered_parts[
-                    filtered_parts["location_name"].astype(str) == selected_location
-                ]
-            if selected_station != "All Stations":
-                filtered_parts = filtered_parts[
-                    filtered_parts["station_name"].astype(str) == selected_station
-                ]
-            if part_search.strip():
-                q = part_search.strip().lower()
-                filtered_parts = filtered_parts[
-                    filtered_parts["parts_name"].astype(str).str.lower().str.contains(q, na=False)
-                    | filtered_parts["station_name"].astype(str).str.lower().str.contains(q, na=False)
-                    | filtered_parts["location_name"].astype(str).str.lower().str.contains(q, na=False)
-                ]
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric("Parts / Machines", f"{len(filtered_parts):,}")
-            with c2:
-                st.metric(
-                    "Total Running Hours",
-                    format_hours(filtered_parts["machine_running_hours"].sum()),
-                )
-
-            display_parts = filtered_parts[
-                ["location_name", "station_name", "parts_name", "machine_running_hours"]
-            ].copy()
-            display_parts = display_parts.rename(
-                columns={
-                    "location_name": "Location",
-                    "station_name": "Station",
-                    "parts_name": "Part / Machine",
-                    "machine_running_hours": "Current Running Hours",
-                }
-            )
-            display_parts["Current Running Hours"] = display_parts["Current Running Hours"].apply(format_hours)
-            st.dataframe(display_parts, use_container_width=True, hide_index=True)
-
-        # ------------------------------------------------------------
-        # MACHINE RUNNING HOURS FROM locations
-        # ------------------------------------------------------------
-        st.markdown('<div class="section-heading">Machine Running Hours</div>', unsafe_allow_html=True)
-        st.caption(
-            "Machine running-hour values are read directly from the locations table in mypalmcom_smartperakmotor. "
-            "Station is available as a filter through the location-to-station mapping."
-        )
-
-        if machines_df.empty:
-            st.info("No machine running-hours records were found in locations.")
-        else:
-            machines_df = machines_df.copy()
-            machines_df["machine_running_hours"] = pd.to_numeric(
-                machines_df["machine_running_hours"], errors="coerce"
-            )
-            machines_df = machines_df.dropna(subset=["location_name"], how="all")
-
-            m1, m2, m3 = st.columns([1, 1, 1.5])
-            machine_location_options = ["All Locations"] + sorted(
-                machines_df["location_name"].dropna().astype(str).unique().tolist()
-            )
-            machine_station_options = ["All Stations"] + sorted(
-                machines_df["station_name"].dropna().astype(str).unique().tolist()
-            )
-            with m1:
-                machine_location = st.selectbox(
-                    "Location",
-                    machine_location_options,
-                    key="maintenance_machine_location",
-                )
-            with m2:
-                machine_station = st.selectbox(
-                    "Station",
-                    machine_station_options,
-                    key="maintenance_machine_station",
-                )
-            with m3:
-                machine_search = st.text_input(
-                    "Search machine / location",
-                    placeholder="Type machine or location name...",
-                    key="maintenance_machine_search",
-                )
-
-            filtered_machines = machines_df.copy()
-            if machine_location != "All Locations":
-                filtered_machines = filtered_machines[
-                    filtered_machines["location_name"].astype(str) == machine_location
-                ]
-            if machine_station != "All Stations":
-                filtered_machines = filtered_machines[
-                    filtered_machines["station_name"].astype(str) == machine_station
-                ]
-            if machine_search.strip():
-                q = machine_search.strip().lower()
-                filtered_machines = filtered_machines[
-                    filtered_machines["location_name"].astype(str).str.lower().str.contains(q, na=False)
-                    | filtered_machines["station_name"].astype(str).str.lower().str.contains(q, na=False)
-                ]
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric("Machines / Locations", f"{len(filtered_machines):,}")
-            with c2:
-                st.metric(
-                    "Total Running Hours",
-                    format_hours(filtered_machines["machine_running_hours"].sum()),
-                )
-
-            display_machines = filtered_machines[
-                ["location_name", "station_name", "machine_running_hours"]
-            ].copy()
-            display_machines = display_machines.rename(
-                columns={
-                    "location_name": "Location",
-                    "station_name": "Station",
-                    "machine_running_hours": "Current Running Hours",
-                }
-            )
-            display_machines["Current Running Hours"] = display_machines["Current Running Hours"].apply(format_hours)
-            st.dataframe(display_machines, use_container_width=True, hide_index=True)
-
-        st.caption("Technical IDs are intentionally hidden from the Maintenance UI.")
-
-    render_maintenance_running_hours_page()
-
 
 # ============================================================
 # OTHER PAGES
